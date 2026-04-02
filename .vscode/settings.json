@@ -1,0 +1,24 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
+  "idf.buildArgs": [
+    "-j",
+    "8"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3",
+    "CCACHE_DIR": "C:\\ccache",
+    "CCACHE_MAXSIZE": "5G"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\src\\reader\\reader\\build"
+  ],
+  "idf.portWin": "COM5",
+  "idf.flashType": "UART"
+}

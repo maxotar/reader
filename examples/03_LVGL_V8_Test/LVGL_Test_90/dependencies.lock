@@ -1,0 +1,36 @@
+dependencies:
+  esp_lcd_sh8601:
+    dependencies: []
+    source:
+      path: C:\src\reader\examples\03_LVGL_V8_Test\LVGL_Test_90\components\esp_lcd_sh8601
+      type: local
+    version: 1.0.0
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.5.3
+  idf:
+    source:
+      type: idf
+    version: 5.5.3
+  lvgl/lvgl:
+    component_hash: d7c1ac037ae6e85d94897f807d6e7ba0946a83e720074fc95a4f6241da9f9f53
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 8.4.0
+direct_dependencies:
+- espressif/cmake_utilities
+- espressif/esp_lcd_sh8601
+- idf
+- lvgl/lvgl
+manifest_hash: bfc478ed374fcfda13fcb3aa13bbda49fca8d87fb45adc0a824c05d983cfa5ec
+target: esp32s3
+version: 2.0.0
