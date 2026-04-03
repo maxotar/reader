@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -25,6 +26,12 @@ static const char *TAG = "amoled_reader";
 #define PIN_NUM_CS 6
 #define PIN_NUM_RST 17
 
+#define I2C_MASTER_SCL_IO 39
+#define I2C_MASTER_SDA_IO 40
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 400000
+#define I2C_ADDR_FT3168 0x38
+
 #define LCD_H_RES 240
 #define LCD_V_RES 536
 
@@ -34,18 +41,10 @@ static lv_disp_drv_t disp_drv;
 static SemaphoreHandle_t lvgl_mux;
 esp_lcd_panel_handle_t panel_handle = NULL;
 
-/* Declare fonts manually to assist the compiler */
-LV_FONT_DECLARE(lv_font_montserrat_8);
-LV_FONT_DECLARE(lv_font_montserrat_10);
-LV_FONT_DECLARE(lv_font_montserrat_12);
-LV_FONT_DECLARE(lv_font_montserrat_14);
-LV_FONT_DECLARE(lv_font_montserrat_16);
+/* Declare fonts */
 LV_FONT_DECLARE(lv_font_montserrat_18);
-LV_FONT_DECLARE(lv_font_montserrat_20);
-LV_FONT_DECLARE(lv_font_montserrat_22);
 LV_FONT_DECLARE(lv_font_montserrat_24);
 
-/* ── LCD Initialization Commands ── */
 static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x11, (uint8_t[]){0x00}, 0, 120},
     {0x3A, (uint8_t[]){0x55}, 1, 0},
@@ -53,12 +52,73 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x2B, (uint8_t[]){0x00, 0x00, 0x00, 0xEF}, 4, 0},
     {0x51, (uint8_t[]){0x00}, 1, 10},
     {0x29, (uint8_t[]){0x00}, 0, 10},
-    {0x51, (uint8_t[]){0xFF}, 1, 0},
+    {0x51, (uint8_t[]){0x30}, 1, 0},
 };
 
-/* ── Callbacks ── */
+/* ── Touch Logic ── */
+void touch_i2c_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0));
+}
 
-// This fires when the QSPI finishes sending a frame of data
+uint8_t getTouch(uint16_t *x, uint16_t *y)
+{
+    uint8_t touch_points_num = 0;
+    uint8_t data_buf[4];
+    uint8_t reg_status = 0x02;
+    uint8_t reg_coords = 0x03;
+
+    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, I2C_ADDR_FT3168,
+                                                 &reg_status, 1, &touch_points_num, 1,
+                                                 pdMS_TO_TICKS(10));
+
+    if (ret == ESP_OK && (touch_points_num & 0x0F) > 0)
+    {
+        ret = i2c_master_write_read_device(I2C_MASTER_NUM, I2C_ADDR_FT3168,
+                                           &reg_coords, 1, data_buf, 4,
+                                           pdMS_TO_TICKS(10));
+
+        if (ret == ESP_OK)
+        {
+            // 1. Extract raw values from the buffer
+            uint16_t raw_y = (((uint16_t)data_buf[0] & 0x0f) << 8) | (uint16_t)data_buf[1];
+            uint16_t raw_x = (((uint16_t)data_buf[2] & 0x0f) << 8) | (uint16_t)data_buf[3];
+
+            // 2. SWAP X and Y because the controller is rotated 90 degrees
+            // Map the touch 'X' to the display 'X' and touch 'Y' to display 'Y'
+            *x = raw_y;
+            *y = raw_x;
+
+            return 1;
+        }
+    }
+    return 0;
+}
+static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+    uint16_t tp_x, tp_y;
+    if (getTouch(&tp_x, &tp_y))
+    {
+        data->point.x = tp_x;
+        data->point.y = tp_y;
+        data->state = LV_INDEV_STATE_PR;
+    }
+    else
+    {
+        data->state = LV_INDEV_STATE_REL;
+    }
+}
+
+/* ── LVGL & Display Callbacks ── */
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
@@ -68,59 +128,59 @@ static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io, esp_lcd_panel_
 
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-    // Forward the buffer to the hardware driver
     esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
 }
 
-// Higher precision tick using ESP Timer (Hardware ISR)
 static void lv_tick_task(void *arg)
 {
     lv_tick_inc(1);
 }
 
-/* ── Tasks ── */
-
 static void lvgl_handler_task(void *arg)
 {
-    ESP_LOGI(TAG, "Starting LVGL main loop");
     while (1)
     {
-        if (xSemaphoreTake(lvgl_mux, portMAX_DELAY) == pdTRUE)
+        uint32_t task_delay_ms = 5;
+        if (xSemaphoreTake(lvgl_mux, 0) == pdTRUE)
         {
-            uint32_t task_delay_ms = lv_timer_handler();
+            task_delay_ms = lv_timer_handler();
             xSemaphoreGive(lvgl_mux);
-
-            // Limit delay to prevent task starvation
-            if (task_delay_ms > 50)
-                task_delay_ms = 50;
-            if (task_delay_ms < 5)
-                task_delay_ms = 5;
-
-            vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
         }
+        if (task_delay_ms == 0)
+            task_delay_ms = 1;
+        if (task_delay_ms > 30)
+            task_delay_ms = 30;
+        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
     }
 }
-
-/* ── Main Init Functions ── */
 
 void lcd_init(void)
 {
     ESP_LOGI(TAG, "Initializing QSPI Bus...");
+
+    // 1. Bus Config using Macro
+    // We use the full screen size for max_transfer_sz because we enabled PSRAM DMA in menuconfig
     spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(
         PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3,
         LCD_H_RES * LCD_V_RES * sizeof(uint16_t));
+
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    ESP_LOGI(TAG, "Installing Panel IO...");
+    // 2. IO Config using Macro
+    esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
+        PIN_NUM_CS,
+        notify_lvgl_flush_ready,
+        &disp_drv);
+
+    // --- PERFORMANCE OVERRIDES ---
+    io_config.pclk_hz = 80 * 1000 * 1000;
+    io_config.trans_queue_depth = 10; // Allow deeper pipeline for smoother frames
+    // -----------------------------
+
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_CS, NULL, NULL);
-
-    // Register the DMA callback so LVGL knows when the transfer is done
-    io_config.on_color_trans_done = notify_lvgl_flush_ready;
-    io_config.user_ctx = &disp_drv;
-
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
 
+    // 3. Vendor & Panel Setup
     sh8601_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
         .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
@@ -134,84 +194,139 @@ void lcd_init(void)
         .vendor_config = &vendor_config,
     };
 
-    ESP_LOGI(TAG, "Installing SH8601 Panel Driver...");
     ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
-    ESP_LOGI(TAG, "AMOLED Initialized");
+    // Extra stability: short delay before turning display on
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 }
 
 void lvgl_setup(void)
 {
     lv_init();
+    lvgl_mux = xSemaphoreCreateMutex();
 
-    // Allocation in PSRAM (SPIRAM) for the S3
-    // We use two full-size buffers for double buffering (No tearing/flicker)
     size_t buffer_size = LCD_H_RES * LCD_V_RES * sizeof(lv_color_t);
+    lv_color_t *buf1 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    lv_color_t *buf2 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    lv_color_t *buf1 = heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (buf1 == NULL || buf2 == NULL)
+    if (!buf1 || !buf2)
     {
-        ESP_LOGE(TAG, "Failed to allocate display buffers in PSRAM!");
+        ESP_LOGE(TAG, "PSRAM Allocation Failed!");
         abort();
     }
 
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * LCD_V_RES);
 
-    /* Initialize the display driver */
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1; // Critical for smooth AMOLED updates
+    disp_drv.full_refresh = 0;
+    // disp_drv.direct_mode = 1;
     lv_disp_drv_register(&disp_drv);
 
-    /* Create High-Precision Tick Timer */
-    const esp_timer_create_args_t lvgl_tick_timer_args = {
-        .callback = &lv_tick_task,
-        .name = "lvgl_tick"};
-    esp_timer_handle_t lvgl_tick_timer = NULL;
-    esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer);
-    esp_timer_start_periodic(lvgl_tick_timer, 1000); // 1ms
+    // Tick & Task
+    const esp_timer_create_args_t tick_args = {.callback = &lv_tick_task, .name = "lvgl_tick"};
+    esp_timer_handle_t tick_timer = NULL;
+    esp_timer_create(&tick_args, &tick_timer);
+    esp_timer_start_periodic(tick_timer, 1000);
 
-    lvgl_mux = xSemaphoreCreateMutex();
+    // Touch Setup
+    touch_i2c_init();
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = lvgl_touch_cb;
+    lv_indev_drv_register(&indev_drv);
 
-    /* Create Handler Task on Core 1 (keep Core 0 for Wi-Fi/System) */
-    xTaskCreatePinnedToCore(lvgl_handler_task, "LVGL", 8192, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(lvgl_handler_task, "LVGL", 8192, NULL, 7, NULL, 1);
 }
 
 void create_ui(void)
 {
     if (xSemaphoreTake(lvgl_mux, portMAX_DELAY) == pdTRUE)
     {
+        lv_color_t book_red = lv_color_make(255, 0, 0);
+        lv_color_t book_black = lv_color_make(0, 0, 0); // Pure AMOLED Black
 
-        // 1. Set the screen to a vertical layout (Flex)
+        // 1. Create a reusable "Opaque" style
+        static lv_style_t style_opaque;
+        lv_style_init(&style_opaque);
+        lv_style_set_bg_opa(&style_opaque, LV_OPA_COVER);
+        lv_style_set_bg_color(&style_opaque, book_black);
+        lv_style_set_text_color(&style_opaque, book_red);
+
+        // 2. Setup Screen - FORCE BLACK HERE
         lv_obj_t *scr = lv_scr_act();
-        lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-        lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN); // Stack vertically
-        lv_obj_set_flex_align(scr, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(scr, 20, 0); // Add 20px gap between items
+        lv_obj_remove_style_all(scr); // Strips any default/theme leftovers
+        lv_obj_add_style(scr, &style_opaque, 0);
+        lv_obj_set_style_bg_color(scr, book_black, 0); // Double-down on Black
 
-        // 2. Main Title
-        lv_obj_t *label = lv_label_create(scr);
-        lv_label_set_text(label, "Hello, World!");
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        // 3. Setup Scrolling Container
+        lv_obj_t *cont = lv_obj_create(scr);
+        lv_obj_remove_style_all(cont); // Strips default grey borders/backgrounds
+        lv_obj_add_style(cont, &style_opaque, 0);
 
-        // 3. Body Text (The one from my previous tip)
-        lv_obj_t *body_text = lv_label_create(scr);
-        lv_label_set_long_mode(body_text, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(body_text, 220);
-        lv_label_set_text(body_text, "This text is rendered with subpixel antialiasing. "
-                                     "On an AMOLED screen, it should look sharp.");
-        lv_obj_set_style_text_font(body_text, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(body_text, lv_color_white(), 0);
-        lv_obj_set_style_text_align(body_text, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
+        lv_obj_set_pos(cont, 0, 0);
+
+        // Kill all default styling aggressively
+        lv_obj_set_style_bg_color(cont, book_black, 0);
+        lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(cont, 0, 0);
+        lv_obj_set_style_outline_width(cont, 0, 0);
+        lv_obj_set_style_shadow_width(cont, 0, 0);
+        lv_obj_set_style_pad_all(cont, 15, 0);
+
+        // Layout
+        lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_OFF);
+
+        // 4. Chapter Title
+        lv_obj_t *title = lv_label_create(cont);
+        lv_label_set_text(title, "CHAPTER ONE");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(title, book_red, 0);
+        lv_obj_set_style_pad_bottom(title, 20, 0);
+
+        // 5. Body Text
+        lv_obj_t *body = lv_label_create(cont);
+        lv_obj_add_style(body, &style_opaque, 0);
+        lv_obj_set_width(body, 210); // Adjust this to your screen width - padding
+        lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(body, "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+                                "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+                                "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris "
+                                "nisi ut aliquip ex ea commodo consequat. \n\n"
+                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+                                "anim id est laborum.\n\n"
+                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+                                "anim id est laborum.\n\n"
+                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+                                "anim id est laborum.\n\n"
+                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+                                "anim id est laborum.\n\n"
+                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+                                "anim id est laborum.\n\n"
+                                "By scrolling with your finger, you can now see the power of "
+                                "this S3 AMOLED reader!");
+
+        lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(body, book_red, 0);
 
         xSemaphoreGive(lvgl_mux);
     }
@@ -222,6 +337,5 @@ void app_main(void)
     lcd_init();
     lvgl_setup();
     create_ui();
-
     ESP_LOGI(TAG, "Application UI created. Memory Free: %u bytes", (unsigned int)esp_get_free_heap_size());
 }
