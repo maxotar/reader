@@ -16,7 +16,6 @@
 
 static const char *TAG = "amoled_reader";
 
-/* ── Hardware Definitions ── */
 #define LCD_HOST SPI2_HOST
 #define PIN_NUM_SCLK 47
 #define PIN_NUM_D0 18
@@ -35,13 +34,11 @@ static const char *TAG = "amoled_reader";
 #define LCD_H_RES 240
 #define LCD_V_RES 536
 
-/* ── LVGL Globals ── */
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 static SemaphoreHandle_t lvgl_mux;
 esp_lcd_panel_handle_t panel_handle = NULL;
 
-/* Declare fonts */
 LV_FONT_DECLARE(lv_font_montserrat_18);
 LV_FONT_DECLARE(lv_font_montserrat_24);
 
@@ -52,10 +49,9 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x2B, (uint8_t[]){0x00, 0x00, 0x00, 0xEF}, 4, 0},
     {0x51, (uint8_t[]){0x00}, 1, 10},
     {0x29, (uint8_t[]){0x00}, 0, 10},
-    {0x51, (uint8_t[]){0x30}, 1, 0},
+    {0x51, (uint8_t[]){0xFF}, 1, 0},
 };
 
-/* ── Touch Logic ── */
 void touch_i2c_init(void)
 {
     i2c_config_t conf = {
@@ -103,6 +99,7 @@ uint8_t getTouch(uint16_t *x, uint16_t *y)
     }
     return 0;
 }
+
 static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     uint16_t tp_x, tp_y;
@@ -118,7 +115,6 @@ static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     }
 }
 
-/* ── LVGL & Display Callbacks ── */
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
@@ -225,7 +221,7 @@ void lvgl_setup(void)
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 0;
+    disp_drv.full_refresh = 1;
     // disp_drv.direct_mode = 1;
     lv_disp_drv_register(&disp_drv);
 
@@ -288,42 +284,42 @@ void create_ui(void)
 
         // 4. Chapter Title
         lv_obj_t *title = lv_label_create(cont);
-        lv_label_set_text(title, "CHAPTER ONE");
         lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(title, book_red, 0);
         lv_obj_set_style_pad_bottom(title, 20, 0);
+        // lv_label_set_text(title, "CHAPTER ONE");
 
         // 5. Body Text
         lv_obj_t *body = lv_label_create(cont);
         lv_obj_add_style(body, &style_opaque, 0);
         lv_obj_set_width(body, 210); // Adjust this to your screen width - padding
         lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-        lv_label_set_text(body, "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-                                "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
-                                "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris "
-                                "nisi ut aliquip ex ea commodo consequat. \n\n"
-                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
-                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
-                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
-                                "anim id est laborum.\n\n"
-                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
-                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
-                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
-                                "anim id est laborum.\n\n"
-                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
-                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
-                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
-                                "anim id est laborum.\n\n"
-                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
-                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
-                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
-                                "anim id est laborum.\n\n"
-                                "Duis aute irure dolor in reprehenderit in voluptate velit esse "
-                                "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
-                                "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
-                                "anim id est laborum.\n\n"
-                                "By scrolling with your finger, you can now see the power of "
-                                "this S3 AMOLED reader!");
+        // lv_label_set_text(body, "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+        //                         "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+        //                         "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris "
+        //                         "nisi ut aliquip ex ea commodo consequat. \n\n"
+        //                         "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        //                         "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+        //                         "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+        //                         "anim id est laborum.\n\n"
+        //                         "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        //                         "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+        //                         "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+        //                         "anim id est laborum.\n\n"
+        //                         "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        //                         "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+        //                         "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+        //                         "anim id est laborum.\n\n"
+        //                         "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        //                         "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+        //                         "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+        //                         "anim id est laborum.\n\n"
+        //                         "Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        //                         "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat "
+        //                         "cupidatat non proident, sunt in culpa qui officia deserunt mollit "
+        //                         "anim id est laborum.\n\n"
+        //                         "By scrolling with your finger, you can now see the power of "
+        //                         "this S3 AMOLED reader!");
 
         lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(body, book_red, 0);
