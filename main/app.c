@@ -1,10 +1,9 @@
-#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -14,9 +13,11 @@
 #include "esp_lcd_sh8601.h"
 #include "lvgl.h"
 
-static const char *TAG = "amoled_reader";
+#include "content.h"
 
-/* --- Hardware Pin Definitions --- */
+static const char *TAG = "amoled_canvas";
+
+/* --- Hardware Pins --- */
 #define LCD_HOST SPI2_HOST
 #define PIN_NUM_SCLK 47
 #define PIN_NUM_D0 18
@@ -28,23 +29,22 @@ static const char *TAG = "amoled_reader";
 
 #define I2C_MASTER_SCL_IO 39
 #define I2C_MASTER_SDA_IO 40
-#define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 400000
 #define I2C_ADDR_FT3168 0x38
 
 #define LCD_H_RES 240
 #define LCD_V_RES 536
 
-/* --- LVGL Globals --- */
+/* --- LVGL Configuration --- */
+#define DRAW_BUF_HEIGHT (LCD_V_RES / 4)
+#define DRAW_BUF_STRIDE (LCD_H_RES * DRAW_BUF_HEIGHT)
+
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 static SemaphoreHandle_t lvgl_mutex;
 esp_lcd_panel_handle_t panel_handle = NULL;
+i2c_master_dev_handle_t dev_handle;
 
-LV_FONT_DECLARE(lv_font_montserrat_18);
-LV_FONT_DECLARE(lv_font_montserrat_24);
-
-/* --- Display Initialization Commands --- */
+/* --- Display Commands --- */
 static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x11, (uint8_t[]){0x00}, 0, 120},
     {0x3A, (uint8_t[]){0x55}, 1, 0},
@@ -55,51 +55,43 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x51, (uint8_t[]){0xFF}, 1, 0},
 };
 
-/* --- Touch Driver (FT3168) --- */
 void touch_i2c_init(void)
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
         .sda_io_num = I2C_MASTER_SDA_IO,
         .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0));
+
+    i2c_master_bus_handle_t bus_handle;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = I2C_ADDR_FT3168,
+        .scl_speed_hz = 400000,
+    };
+
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
 }
 
 uint8_t ft3168_read_touch(uint16_t *x, uint16_t *y)
 {
-    uint8_t touch_points_num = 0;
-    uint8_t data_buf[4];
-    uint8_t reg_status = 0x02;
-    uint8_t reg_coords = 0x03;
+    uint8_t data_buf[6];
+    uint8_t reg_start = 0x02;
 
-    // Check how many touch points are currently active
-    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, I2C_ADDR_FT3168,
-                                                 &reg_status, 1, &touch_points_num, 1,
-                                                 pdMS_TO_TICKS(10));
+    esp_err_t ret = i2c_master_transmit_receive(dev_handle, &reg_start, 1, data_buf, 6, -1);
 
-    if (ret == ESP_OK && (touch_points_num & 0x0F) > 0)
+    if (ret == ESP_OK && (data_buf[0] & 0x0F) > 0)
     {
-        // Read the actual coordinates for the first touch point
-        ret = i2c_master_write_read_device(I2C_MASTER_NUM, I2C_ADDR_FT3168,
-                                           &reg_coords, 1, data_buf, 4,
-                                           pdMS_TO_TICKS(10));
-
-        if (ret == ESP_OK)
-        {
-            uint16_t raw_y = (((uint16_t)data_buf[0] & 0x0F) << 8) | (uint16_t)data_buf[1];
-            uint16_t raw_x = (((uint16_t)data_buf[2] & 0x0F) << 8) | (uint16_t)data_buf[3];
-
-            // Swap X and Y due to the physical rotation of the touch controller vs display
-            *x = raw_y;
-            *y = raw_x;
-
-            return 1;
-        }
+        uint16_t raw_y = ((uint16_t)(data_buf[1] & 0x0F) << 8) | data_buf[2];
+        uint16_t raw_x = ((uint16_t)(data_buf[3] & 0x0F) << 8) | data_buf[4];
+        *x = raw_y;
+        *y = raw_x;
+        return 1;
     }
     return 0;
 }
@@ -119,11 +111,10 @@ static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     }
 }
 
-/* --- LVGL Display Flushing --- */
+/* --- LVGL Callbacks --- */
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
-    lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
-    lv_disp_flush_ready(disp_driver);
+    lv_disp_flush_ready((lv_disp_drv_t *)user_ctx);
     return false;
 }
 
@@ -132,113 +123,62 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
 }
 
-/* --- LVGL System Tasks --- */
-static void lv_tick_task(void *arg)
-{
-    lv_tick_inc(1);
-}
+static void lv_tick_task(void *arg) { lv_tick_inc(1); }
 
 static void lvgl_handler_task(void *arg)
 {
     while (1)
     {
-        uint32_t task_delay_ms = 5;
-        if (xSemaphoreTake(lvgl_mutex, 0) == pdTRUE)
+        uint32_t delay = 10;
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            task_delay_ms = lv_timer_handler();
+            delay = lv_timer_handler();
             xSemaphoreGive(lvgl_mutex);
         }
-
-        // Ensure delay is within reasonable bounds (1ms to 30ms)
-        if (task_delay_ms == 0)
-            task_delay_ms = 1;
-        else if (task_delay_ms > 30)
-            task_delay_ms = 30;
-
-        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+        vTaskDelay(pdMS_TO_TICKS(delay < 5 ? 5 : delay));
     }
 }
 
-/* --- Initialization Sequences --- */
+/* --- Core Logic --- */
 void lcd_init(void)
 {
-    ESP_LOGI(TAG, "Initializing QSPI Bus...");
-
-    // Bus Config using Macro (max_transfer_sz leverages PSRAM DMA)
-    spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(
-        PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3,
-        LCD_H_RES * LCD_V_RES * sizeof(uint16_t));
-
+    spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3, LCD_H_RES * 80);
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    // IO Config using Macro
-    esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
-        PIN_NUM_CS,
-        notify_lvgl_flush_ready,
-        &disp_drv);
-
-    // Performance Overrides
-    io_config.pclk_hz = 80 * 1000 * 1000;
-    io_config.trans_queue_depth = 10;
-
+    esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_CS, notify_lvgl_flush_ready, &disp_drv);
     esp_lcd_panel_io_handle_t io_handle = NULL;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
 
-    // Vendor & Panel Setup
-    sh8601_vendor_config_t vendor_config = {
-        .init_cmds = lcd_init_cmds,
-        .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
-        .flags = {.use_qspi_interface = 1},
-    };
-
-    esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_NUM_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 16,
-        .vendor_config = &vendor_config,
-    };
-
+    sh8601_vendor_config_t vendor_config = {.init_cmds = lcd_init_cmds, .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]), .flags.use_qspi_interface = 1};
+    esp_lcd_panel_dev_config_t panel_config = {.reset_gpio_num = PIN_NUM_RST, .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, .bits_per_pixel = 16, .vendor_config = &vendor_config};
     ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &panel_config, &panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
-    // Short delay before turning display on for stability
+    esp_lcd_panel_reset(panel_handle);
+    esp_lcd_panel_init(panel_handle);
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    esp_lcd_panel_disp_on_off(panel_handle, true);
 }
+
+static DMA_ATTR uint16_t draw_buf_1[DRAW_BUF_STRIDE];
+static DMA_ATTR uint16_t draw_buf_2[DRAW_BUF_STRIDE];
 
 void lvgl_setup(void)
 {
     lv_init();
     lvgl_mutex = xSemaphoreCreateMutex();
-
-    size_t buffer_size = LCD_H_RES * LCD_V_RES * sizeof(lv_color_t);
-    lv_color_t *buf1 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (!buf1 || !buf2)
-    {
-        ESP_LOGE(TAG, "PSRAM Allocation Failed!");
-        abort();
-    }
-
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * LCD_V_RES);
-
+    lv_disp_draw_buf_init(&draw_buf, draw_buf_1, draw_buf_2, DRAW_BUF_STRIDE);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.flush_cb = lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1;
     lv_disp_drv_register(&disp_drv);
 
-    // Tick Timer
-    const esp_timer_create_args_t tick_args = {.callback = &lv_tick_task, .name = "lvgl_tick"};
-    esp_timer_handle_t tick_timer = NULL;
+    const esp_timer_create_args_t tick_args = {.callback = &lv_tick_task, .name = "tick"};
+    esp_timer_handle_t tick_timer;
     esp_timer_create(&tick_args, &tick_timer);
     esp_timer_start_periodic(tick_timer, 1000);
 
-    // Touch Setup
     touch_i2c_init();
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
@@ -246,7 +186,7 @@ void lvgl_setup(void)
     indev_drv.read_cb = lvgl_touch_cb;
     lv_indev_drv_register(&indev_drv);
 
-    xTaskCreatePinnedToCore(lvgl_handler_task, "LVGL", 8192, NULL, 7, NULL, 1);
+    xTaskCreatePinnedToCore(lvgl_handler_task, "LVGL", 8192, NULL, 5, NULL, 1);
 }
 
 void create_ui(void)
@@ -254,62 +194,43 @@ void create_ui(void)
     if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
     {
         lv_obj_t *scr = lv_scr_act();
+        lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
 
-        // 1. Create a Scrolling Container (The "Page")
+        // Scrollable Container
         lv_obj_t *cont = lv_obj_create(scr);
-        lv_obj_set_size(cont, LV_PCT(100), LV_PCT(100));
-
-        // Strip out manual background styling. We make the container transparent
-        // and borderless so it inherits the default dark theme of the active screen.
-        lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+        lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
+        lv_obj_set_style_pad_all(cont, 0, 0);
         lv_obj_set_style_border_width(cont, 0, 0);
-        lv_obj_set_style_pad_all(cont, 20, 0); // Keep padding for readability
+        lv_obj_set_style_bg_opa(cont, 0, 0);
+        lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scroll_dir(cont, LV_DIR_VER);
 
-        // Layout: Vertical stack
-        lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+        // Canvas Setup (Height 2000px)
+        uint16_t canvas_h = 2000;
+        size_t cbuf_size = LCD_H_RES * canvas_h * sizeof(lv_color_t);
+        lv_color_t *cbuf = heap_caps_malloc(cbuf_size, MALLOC_CAP_SPIRAM);
 
-        // Set scrollbar mode to AUTO so it only appears when scrolling
-        lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
+        if (cbuf)
+        {
+            lv_obj_t *canvas = lv_canvas_create(cont);
+            lv_canvas_set_buffer(canvas, cbuf, LCD_H_RES, canvas_h, LV_IMG_CF_TRUE_COLOR);
+            lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+            lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
 
-        // 2. Chapter Title
-        lv_obj_t *title = lv_label_create(cont);
-        lv_label_set_text(title, "CHAPTER II:\nTHE VOID");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_pad_bottom(title, 20, 0);
+            lv_draw_label_dsc_t dsc;
+            lv_draw_label_dsc_init(&dsc);
+            dsc.color = lv_color_hex(0xFFFFFF);
+            dsc.font = &lv_font_montserrat_24;
+            lv_canvas_draw_text(canvas, 10, 20, 220, &dsc, book_title);
 
-        // 3. Body Text Content (Greatly expanded to force scrolling)
-        lv_obj_t *body = lv_label_create(cont);
-        lv_obj_set_width(body, LV_PCT(100)); // Wrap text to container width
-        lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_line_space(body, 8, 0);
-
-        lv_label_set_text(body,
-                          "The S3 processor hummed silently as the pixels transitioned. "
-                          "In the realm of AMOLED, black is not a color—it is an absence. "
-                          "Every diode turned off, saving power and preserving the deep, "
-                          "infinite darkness of the display.\n\n"
-                          "This is the advantage of the SH8601. When the driver is tuned correctly, "
-                          "the text appears to float in the physical air of the room, unburdened "
-                          "by the backlight glow of traditional LCD panels.\n\n"
-                          "By relying entirely on the native LVGL Dark Theme, we allow the "
-                          "framework to handle the styling autonomously. The internal memory "
-                          "buffers remain pristine, preventing unnecessary styling overrides "
-                          "from clogging the CPU cycles before the DMA fires.\n\n"
-                          "To properly test the bounds of this interface, we must extend "
-                          "our data payload. As you drag your finger across the capacitive "
-                          "glass, the FT3168 touch controller interprets the disruption in "
-                          "its electromagnetic field. It calculates the X and Y coordinates "
-                          "in real-time, firing off an interrupt over the I2C bus.\n\n"
-                          "The ESP32 catches this signal, processes it through the input "
-                          "device driver, and translates the raw capacitive data into a "
-                          "fluid, kinetic scroll. \n\n"
-                          "If everything is calibrated perfectly, the transition should be "
-                          "seamless. The pixels will ignite and extinguish at 80MHz, pushing "
-                          "data across the Quad-SPI bus fast enough to trick the human eye "
-                          "into seeing motion where there is only light and the void.");
+            dsc.font = &lv_font_montserrat_18;
+            dsc.color = lv_color_hex(0xD0D0D0);
+            // Drawing the body text from content.h
+            lv_canvas_draw_text(canvas, 10, 70, 220, &dsc, book_content);
+        }
 
         xSemaphoreGive(lvgl_mutex);
+        ESP_LOGI(TAG, "UI created with single canvas in PSRAM.");
     }
 }
 
@@ -318,5 +239,4 @@ void app_main(void)
     lcd_init();
     lvgl_setup();
     create_ui();
-    ESP_LOGI(TAG, "Application UI created. Memory Free: %u bytes", (unsigned int)esp_get_free_heap_size());
 }

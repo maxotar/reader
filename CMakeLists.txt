@@ -1,5 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 
+set(COMPONENTS 
+    main 
+    esp_lcd 
+    lvgl 
+    freertos 
+    esp_timer 
+    driver 
+    esp_hw_support 
+    heap 
+    log 
+    soc 
+    hal 
+    esp_rom 
+    esp_common 
+    esp_system 
+    xtensa 
+    newlib
+)
+
 # sccache integration
 find_program(SCCACHE sccache)
 if(SCCACHE)
