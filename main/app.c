@@ -1,3 +1,33 @@
+
+/*
+    ESP32-S3 AMOLED E-Reader Rendering Pipeline (High-Level Design)
+
+    This project implements a low-power, high-performance e-reader UI targeting
+    a 1.91" AMOLED display driven by the SH8601 controller on an ESP32-S3 platform.
+
+    The goal is to render text-centric content (EPUB chapters, documents, and
+    long-form reading material) with a visually minimal aesthetic:
+        - Pure black background (pixel-off AMOLED state)
+        - High-contrast red typography for reduced eye strain and clarity
+        - Scrollable continuous reading surface
+        - Target refresh rate: stable ~50 FPS during interaction/scrolling
+
+    The system is designed around constrained embedded hardware resources:
+
+    Hardware characteristics:
+        - ESP32-S3 dual-core MCU @ up to 240 MHz
+        - 8 MB external PSRAM (primary framebuffer and tile cache storage)
+        - Internal SRAM/IRAM for time-critical execution paths
+        - 16 MB external SPI flash (firmware, assets, and persistent storage)
+        - QSPI-connected SH8601 AMOLED display controller (240x536 resolution)
+        - Capacitive touch input (FT3168 via I2C)
+        - Portrait orientation with vertical scrolling as the primary interaction model
+
+    The system is intended to evolve toward:
+        - Tile-based rendering of large documents
+        - Cached rasterized text regions for reuse during scroll
+*/
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -24,8 +54,9 @@ static const char *TAG = "reader";
 
 #define LCD_H_RES 240
 #define LCD_V_RES 536
-#define BUFFER_HEIGHT 64
+#define BUFFER_HEIGHT LCD_V_RES
 #define DRAW_PIXELS (LCD_H_RES * BUFFER_HEIGHT)
+#define FULL_SCREEN_BUF_SIZE (LCD_H_RES * LCD_V_RES * sizeof(lv_color_t))
 
 #define I2C_MASTER_SCL_IO 39
 #define I2C_MASTER_SDA_IO 40
@@ -129,7 +160,7 @@ static void lcd_init(void)
 {
     spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(
         PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3,
-        LCD_H_RES * BUFFER_HEIGHT * sizeof(lv_color_t));
+        FULL_SCREEN_BUF_SIZE);
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_spi_config_t io_config =
@@ -187,77 +218,52 @@ static void lvgl_init_display(void)
     lv_indev_drv_register(&indev);
 }
 
+#define CANVAS_WIDTH LCD_H_RES
+#define CANVAS_HEIGHT 4000 // Adjust based on your content length
+static uint8_t *canvas_buf;
+
 static void create_ui(void)
 {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    /* Remove any default padding on the screen */
-    lv_obj_set_style_pad_all(scr, 0, 0);
 
-    /* ── Scrollable page container ────────────────────────────── */
-    lv_obj_t *page = lv_obj_create(scr);
-    lv_obj_set_size(page, LCD_H_RES, LCD_V_RES);
-    lv_obj_align(page, LV_ALIGN_TOP_LEFT, 0, 0);
+    // 1. Allocate large PSRAM buffer for the pre-rendered content
+    uint32_t buf_size = LV_CANVAS_BUF_SIZE_TRUE_COLOR(CANVAS_WIDTH, CANVAS_HEIGHT);
+    canvas_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    if (!canvas_buf)
+    {
+        ESP_LOGE(TAG, "Failed to allocate canvas buffer!");
+        return;
+    }
 
-    /* Transparent, borderless — the screen IS the page */
-    lv_obj_set_style_bg_color(page, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(page, 0, 0);
-    lv_obj_set_style_pad_left(page, PAD_H, 0);
-    lv_obj_set_style_pad_right(page, PAD_H, 0);
-    lv_obj_set_style_pad_top(page, PAD_TOP, 0);
-    lv_obj_set_style_pad_bottom(page, PAD_BOT, 0);
+    // 2. Create the Canvas
+    lv_obj_t *canvas = lv_canvas_create(scr);
+    lv_canvas_set_buffer(canvas, canvas_buf, CANVAS_WIDTH, CANVAS_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_style_bg_color(canvas, lv_color_hex(C_BG), 0);
+    lv_canvas_fill_bg(canvas, lv_color_hex(C_BG), LV_OPA_COVER);
 
-    /* Vertical-only scrolling with momentum */
-    lv_obj_set_scroll_dir(page, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_ACTIVE);
-    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLL_MOMENTUM);
-    lv_obj_add_flag(page, LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLL_CHAIN);
+    // 3. Bake the Title
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = lv_color_hex(C_TITLE);
+    label_dsc.font = FONT_TITLE;
+    label_dsc.line_space = LINE_SPACE + 2;
+    lv_canvas_draw_text(canvas, PAD_H, PAD_TOP, CANVAS_WIDTH - (PAD_H * 2), &label_dsc, chapter_title);
 
-    /* Scrollbar: thin deep-red strip on the right */
-    lv_obj_set_style_width(page, 3, LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(page, lv_color_hex(C_SCROLLBAR), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(page, 0, LV_PART_SCROLLBAR);
+    // 4. Bake the Body (offset by title height)
+    // In a real app, you'd calculate the title height dynamically.
+    label_dsc.color = lv_color_hex(C_BODY);
+    label_dsc.font = FONT_BODY;
+    label_dsc.line_space = LINE_SPACE;
+    lv_canvas_draw_text(canvas, PAD_H, PAD_TOP + 60, CANVAS_WIDTH - (PAD_H * 2), &label_dsc, chapter_content);
 
-    /* ── Column layout so children stack vertically ───────────── */
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(page,
-                          LV_FLEX_ALIGN_START,  /* main axis  */
-                          LV_FLEX_ALIGN_START,  /* cross axis */
-                          LV_FLEX_ALIGN_START); /* track      */
-    lv_obj_set_style_pad_row(page, 10, 0);      /* gap between flex children */
-
-    /* ── Chapter title ────────────────────────────────────────── */
-    lv_obj_t *title = lv_label_create(page);
-    lv_label_set_text(title, chapter_title);
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(title, LCD_H_RES - PAD_H * 2);
-    lv_obj_set_style_text_font(title, FONT_TITLE, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(C_TITLE), 0);
-    lv_obj_set_style_text_line_space(title, LINE_SPACE + 2, 0);
-
-    /* ── Thin divider line under title ───────────────────────── */
-    lv_obj_t *div = lv_obj_create(page);
-    lv_obj_set_size(div, LCD_H_RES - PAD_H * 2, 1);
-    lv_obj_set_style_bg_color(div, lv_color_hex(C_DIVIDER), 0);
-    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(div, 0, 0);
-    lv_obj_set_style_pad_all(div, 0, 0);
-    lv_obj_clear_flag(div, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* ── Body text ────────────────────────────────────────────── */
-    lv_obj_t *body = lv_label_create(page);
-    lv_label_set_text(body, chapter_content);
-    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(body, LCD_H_RES - PAD_H * 2);
-    lv_obj_set_style_text_font(body, FONT_BODY, 0);
-    lv_obj_set_style_text_color(body, lv_color_hex(C_BODY), 0);
-    lv_obj_set_style_text_line_space(body, LINE_SPACE, 0);
+    // 5. Transform Canvas into a scrollable image
+    // We clear flags on canvas and put it in a container, or simply move the canvas Y.
+    // Easiest "best-case" test: Move the canvas itself.
+    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(canvas, LV_SCROLLBAR_MODE_OFF);
 }
-
 static void lvgl_task(void *arg)
 {
     TickType_t t = xTaskGetTickCount();
