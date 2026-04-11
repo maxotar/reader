@@ -1,9 +1,9 @@
 #ifndef CONTENT_H
 #define CONTENT_H
 
-const char book_title[] = "CHAPTER II:\nTHE VOID";
+const char chapter_title[] = "CHAPTER II:\nTHE VOID";
 
-const char book_content[] =
+const char chapter_content[] =
     "The S3 processor hummed silently as the pixels transitioned. "
     "In the realm of AMOLED, black is not a color-it is an absence. "
     "Every diode turned off, saving power and preserving the deep, "
