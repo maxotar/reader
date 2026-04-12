@@ -1,4 +1,3 @@
-
 /*
     ESP32-S3 AMOLED E-Reader Rendering Pipeline (High-Level Design)
 
@@ -10,7 +9,7 @@
         - Pure black background (pixel-off AMOLED state)
         - High-contrast red typography for reduced eye strain and clarity
         - Scrollable continuous reading surface
-        - Target refresh rate: stable ~50 FPS during interaction/scrolling
+        - Target refresh rate: stable ~100 FPS during interaction/scrolling
 
     The system is designed around constrained embedded hardware resources:
 
@@ -54,39 +53,28 @@ static const char *TAG = "reader";
 
 #define LCD_H_RES 240
 #define LCD_V_RES 536
-#define BUFFER_HEIGHT LCD_V_RES
-#define DRAW_PIXELS (LCD_H_RES * BUFFER_HEIGHT)
-#define FULL_SCREEN_BUF_SIZE (LCD_H_RES * LCD_V_RES * sizeof(lv_color_t))
+#define CANVAS_HEIGHT 4000
 
 #define I2C_MASTER_SCL_IO 39
 #define I2C_MASTER_SDA_IO 40
 #define I2C_ADDR_FT3168 0x38
 
-/* ── Colors ──────────────────────────────────────────────────── */
-#define C_BG 0x000000
-#define C_TITLE 0xFF2200     /* bright red for the chapter heading   */
-#define C_BODY 0xCC1100      /* slightly dimmer red for body copy    */
-#define C_SCROLLBAR 0x440000 /* near-invisible deep red scrollbar    */
-#define C_DIVIDER 0x330000
+// --- Shared State ---
+static volatile int32_t scroll_y = 0;
+static volatile uint16_t touch_y = 0;
+static volatile bool is_touching = false;
+static volatile bool spi_bus_busy = false;
+static volatile bool is_rendering_baked = false;
 
-/* ── Fonts ───────────────────────────────────────────────────── */
-/* Montserrat 18 for title, 16 for body — both ship with LVGL     */
-#define FONT_TITLE (&lv_font_montserrat_18)
-#define FONT_BODY (&lv_font_montserrat_16)
-
-/* ── Padding / layout ────────────────────────────────────────── */
-#define PAD_H 14 /* horizontal inner padding (each side) */
-#define PAD_TOP 20
-#define PAD_BOT 40
-#define LINE_SPACE 4 /* extra px between lines               */
-
-static lv_disp_draw_buf_t draw_buf;
+static lv_color_t *canvas_buffer = NULL;
+static esp_lcd_panel_handle_t panel = NULL;
+static esp_lcd_panel_io_handle_t io_handle = NULL;
+static i2c_master_dev_handle_t touch_dev = NULL;
 static lv_disp_drv_t disp_drv;
-static esp_lcd_panel_handle_t panel;
-static esp_lcd_panel_io_handle_t io_handle;
-static i2c_master_dev_handle_t touch_dev;
 
-/* ── LCD init table ──────────────────────────────────────────── */
+static uint32_t frame_count = 0;
+static uint32_t last_frame_count = 0;
+
 static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x11, (uint8_t[]){0x00}, 0, 120},
     {0x2A, (uint8_t[]){0x00, 0x00, 0x02, 0x17}, 4, 0},
@@ -96,19 +84,144 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x51, (uint8_t[]){0xFF}, 1, 0},
 };
 
-static bool flush_ready_cb(esp_lcd_panel_io_handle_t io,
-                           esp_lcd_panel_io_event_data_t *edata, void *ctx)
+IRAM_ATTR static bool flush_ready_cb(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx)
 {
+    spi_bus_busy = false;
     lv_disp_flush_ready(&disp_drv);
     return false;
 }
 
-static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *a, lv_color_t *px)
+static void tick_cb(void *arg) { lv_tick_inc(1); }
+
+static void touch_poll_task(void *arg)
 {
-    esp_lcd_panel_draw_bitmap(panel, a->x1, a->y1, a->x2 + 1, a->y2 + 1, px);
+    uint8_t reg = 0x02, data[6];
+    while (1)
+    {
+        if (i2c_master_transmit_receive(touch_dev, &reg, 1, data, 6, pdMS_TO_TICKS(10)) == ESP_OK)
+        {
+            is_touching = (data[0] & 0x0F) > 0;
+            if (is_touching)
+            {
+                touch_y = ((data[3] & 0x0F) << 8) | data[4];
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
-static void tick_cb(void *arg) { lv_tick_inc(1); }
+IRAM_ATTR static void render_task(void *arg)
+{
+    uint16_t last_touch_y = 0;
+    int32_t max_scroll_y = CANVAS_HEIGHT - LCD_V_RES;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    if (max_scroll_y < 0)
+        max_scroll_y = 0;
+
+    while (1)
+    {
+        if (is_touching)
+        {
+            if (last_touch_y != 0)
+            {
+                scroll_y -= (touch_y - last_touch_y);
+                if (scroll_y < 0)
+                    scroll_y = 0;
+                if (scroll_y > max_scroll_y)
+                    scroll_y = max_scroll_y;
+            }
+            last_touch_y = touch_y;
+        }
+        else
+        {
+            last_touch_y = 0;
+        }
+
+        if (is_rendering_baked && canvas_buffer && !spi_bus_busy)
+        {
+            spi_bus_busy = true;
+            lv_color_t *ptr = &canvas_buffer[scroll_y * LCD_H_RES];
+            esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, ptr);
+            frame_count++;
+        }
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(16));
+    }
+}
+
+static void stats_task(void *arg)
+{
+    char *stats_buf = malloc(1024);
+    int64_t last_time = esp_timer_get_time();
+    last_frame_count = frame_count;
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Sample every 5 seconds for stability
+
+        int64_t now = esp_timer_get_time();
+        int64_t delta_time_us = now - last_time;
+        uint32_t delta_frames = frame_count - last_frame_count;
+
+        // Calculate actual FPS: (Frames / Microseconds) * 1,000,000
+        float real_fps = (delta_frames * 1000000.0f) / delta_time_us;
+
+        last_time = now;
+        last_frame_count = frame_count;
+
+        // Bus Load: (FPS * 6.4ms transfer time) / 1000ms
+        float bus_load = (real_fps * 6.4f) / 10.0f;
+
+        printf("\n--- SYSTEM AUDIT ---\n");
+        printf("Performance: %.1f FPS | Bus Load: %.1f%%\n", real_fps, bus_load);
+
+        if (stats_buf)
+        {
+            vTaskGetRunTimeStats(stats_buf);
+            printf("Task Load:\n%s", stats_buf);
+        }
+        printf("----------------------------------------\n");
+    }
+}
+
+static void bake_content(void)
+{
+    size_t sz = LCD_H_RES * CANVAS_HEIGHT * sizeof(lv_color_t);
+    canvas_buffer = heap_caps_aligned_alloc(64, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    memset(canvas_buffer, 0, sz);
+
+    lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
+    lv_canvas_set_buffer(canvas, canvas_buffer, LCD_H_RES, CANVAS_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = lv_color_hex(0xFF2200);
+    label_dsc.font = &lv_font_montserrat_18;
+    lv_canvas_draw_text(canvas, 14, 20, LCD_H_RES - 28, &label_dsc, chapter_title);
+
+    label_dsc.color = lv_color_hex(0xCC1100);
+    label_dsc.font = &lv_font_montserrat_16;
+    label_dsc.line_space = 4;
+    lv_canvas_draw_text(canvas, 14, 80, LCD_H_RES - 28, &label_dsc, chapter_content);
+
+    lv_obj_del(canvas);
+    is_rendering_baked = true;
+}
+
+static void lcd_init(void)
+{
+    spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3, (LCD_H_RES * LCD_V_RES * 2));
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_CS, flush_ready_cb, NULL);
+    io_config.trans_queue_depth = 3;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
+    sh8601_vendor_config_t vendor = {.init_cmds = lcd_init_cmds, .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]), .flags.use_qspi_interface = 1};
+    esp_lcd_panel_dev_config_t cfg = {.reset_gpio_num = PIN_NUM_RST, .bits_per_pixel = 16, .vendor_config = &vendor};
+    ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &cfg, &panel));
+    esp_lcd_panel_reset(panel);
+    esp_lcd_panel_init(panel);
+    esp_lcd_panel_disp_on_off(panel, true);
+}
 
 static void touch_init(void)
 {
@@ -119,6 +232,7 @@ static void touch_init(void)
         .sda_io_num = I2C_MASTER_SDA_IO,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true};
+
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
 
@@ -129,155 +243,29 @@ static void touch_init(void)
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &touch_dev));
 }
 
-static bool touch_read(uint16_t *x, uint16_t *y)
+void app_main(void)
 {
-    uint8_t reg = 0x02, data[6];
-    esp_err_t r = i2c_master_transmit_receive(touch_dev, &reg, 1,
-                                              data, 6, pdMS_TO_TICKS(10));
-    if (r != ESP_OK || (data[0] & 0x0F) == 0)
-        return false;
-    *x = ((data[1] & 0x0F) << 8) | data[2];
-    *y = ((data[3] & 0x0F) << 8) | data[4];
-    return true;
-}
-
-static void touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
-{
-    uint16_t x, y;
-    if (touch_read(&x, &y))
-    {
-        data->point.x = x;
-        data->point.y = y;
-        data->state = LV_INDEV_STATE_PR;
-    }
-    else
-    {
-        data->state = LV_INDEV_STATE_REL;
-    }
-}
-
-static void lcd_init(void)
-{
-    spi_bus_config_t buscfg = SH8601_PANEL_BUS_QSPI_CONFIG(
-        PIN_NUM_SCLK, PIN_NUM_D0, PIN_NUM_D1, PIN_NUM_D2, PIN_NUM_D3,
-        FULL_SCREEN_BUF_SIZE);
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
-
-    esp_lcd_panel_io_spi_config_t io_config =
-        SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_CS, flush_ready_cb, &disp_drv);
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
-
-    sh8601_vendor_config_t vendor = {
-        .init_cmds = lcd_init_cmds,
-        .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
-        .flags.use_qspi_interface = 1};
-    esp_lcd_panel_dev_config_t cfg = {
-        .reset_gpio_num = PIN_NUM_RST,
-        .bits_per_pixel = 16,
-        .vendor_config = &vendor};
-    ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &cfg, &panel));
-    esp_lcd_panel_reset(panel);
-    esp_lcd_panel_init(panel);
-    esp_lcd_panel_disp_on_off(panel, true);
-}
-
-static void lvgl_init_display(void)
-{
+    lcd_init();
+    touch_init();
     lv_init();
 
-    size_t buffer_size = LCD_H_RES * LCD_V_RES * sizeof(lv_color_t);
-    lv_color_t *buf1 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    lv_color_t *buf2 = heap_caps_aligned_alloc(64, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-
-    if (!buf1 || !buf2)
-    {
-        ESP_LOGE(TAG, "PSRAM Allocation Failed!");
-        abort();
-    }
-
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * LCD_V_RES);
-
+    static lv_disp_draw_buf_t dbuf;
+    lv_color_t *b1 = heap_caps_aligned_alloc(64, LCD_H_RES * 40 * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    lv_disp_draw_buf_init(&dbuf, b1, NULL, LCD_H_RES * 40);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
     disp_drv.ver_res = LCD_V_RES;
-    disp_drv.flush_cb = flush_cb;
-    disp_drv.draw_buf = &draw_buf;
-    // disp_drv.full_refresh = 1;
+    disp_drv.draw_buf = &dbuf;
     lv_disp_drv_register(&disp_drv);
 
     const esp_timer_create_args_t t_args = {.callback = tick_cb};
     esp_timer_handle_t timer;
-    ESP_ERROR_CHECK(esp_timer_create(&t_args, &timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, 1000));
+    esp_timer_create(&t_args, &timer);
+    esp_timer_start_periodic(timer, 1000);
 
-    touch_init();
-    static lv_indev_drv_t indev;
-    lv_indev_drv_init(&indev);
-    indev.type = LV_INDEV_TYPE_POINTER;
-    indev.read_cb = touch_cb;
-    lv_indev_drv_register(&indev);
-}
+    bake_content();
 
-#define CANVAS_WIDTH LCD_H_RES
-#define CANVAS_HEIGHT 4000 // Adjust based on your content length
-static uint8_t *canvas_buf;
-
-static void create_ui(void)
-{
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
-
-    // 1. Allocate large PSRAM buffer for the pre-rendered content
-    uint32_t buf_size = LV_CANVAS_BUF_SIZE_TRUE_COLOR(CANVAS_WIDTH, CANVAS_HEIGHT);
-    canvas_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    if (!canvas_buf)
-    {
-        ESP_LOGE(TAG, "Failed to allocate canvas buffer!");
-        return;
-    }
-
-    // 2. Create the Canvas
-    lv_obj_t *canvas = lv_canvas_create(scr);
-    lv_canvas_set_buffer(canvas, canvas_buf, CANVAS_WIDTH, CANVAS_HEIGHT, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_style_bg_color(canvas, lv_color_hex(C_BG), 0);
-    lv_canvas_fill_bg(canvas, lv_color_hex(C_BG), LV_OPA_COVER);
-
-    // 3. Bake the Title
-    lv_draw_label_dsc_t label_dsc;
-    lv_draw_label_dsc_init(&label_dsc);
-    label_dsc.color = lv_color_hex(C_TITLE);
-    label_dsc.font = FONT_TITLE;
-    label_dsc.line_space = LINE_SPACE + 2;
-    lv_canvas_draw_text(canvas, PAD_H, PAD_TOP, CANVAS_WIDTH - (PAD_H * 2), &label_dsc, chapter_title);
-
-    // 4. Bake the Body (offset by title height)
-    // In a real app, you'd calculate the title height dynamically.
-    label_dsc.color = lv_color_hex(C_BODY);
-    label_dsc.font = FONT_BODY;
-    label_dsc.line_space = LINE_SPACE;
-    lv_canvas_draw_text(canvas, PAD_H, PAD_TOP + 60, CANVAS_WIDTH - (PAD_H * 2), &label_dsc, chapter_content);
-
-    // 5. Transform Canvas into a scrollable image
-    // We clear flags on canvas and put it in a container, or simply move the canvas Y.
-    // Easiest "best-case" test: Move the canvas itself.
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(canvas, LV_SCROLLBAR_MODE_OFF);
-}
-static void lvgl_task(void *arg)
-{
-    TickType_t t = xTaskGetTickCount();
-    while (1)
-    {
-        lv_timer_handler();
-        vTaskDelayUntil(&t, pdMS_TO_TICKS(10));
-    }
-}
-
-void app_main(void)
-{
-    lcd_init();
-    lvgl_init_display();
-    create_ui();
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(touch_poll_task, "touch", 4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(stats_task, "stats", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(render_task, "render", 8192, NULL, 10, NULL, 1);
 }
