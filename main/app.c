@@ -32,9 +32,8 @@
         LVGL 11-bit canvas limit:
             lv_img_header_t stores canvas width/height in 11-bit fields (max 2047px).
             Any canvas taller than 2047px is silently truncated; all text draws beyond
-            that pixel row produce no output and no error. Fixed by using
-            BAKE_CHUNK_HEIGHT canvas windows that offset directly into the PSRAM
-            buffer, keeping every individual canvas safely under 2047px.
+            that pixel row produce no output and no error. Fixed by keeping each
+            runtime tile bitmap at 1024px tall, safely under the 2047px limit.
 
         Display context ordering:
             lv_txt_get_size requires a registered LVGL display to resolve font metrics.
@@ -53,14 +52,13 @@
             Leaving it stale keeps the render task in 8 ms active pacing indefinitely,
             blocking the return to the 50 ms idle sleep and burning CPU.
 
-    Phase 3 - tile-based rendering (current):
-        The monolithic canvas_buffer is logically divided into fixed-height tile
-        descriptors. Each render_tile_t holds a buffer pointer, y-range, and a
-        valid flag. Viewport blitting uses find_tile_for_y to locate the correct
-        tile, then either blits directly (fast path: viewport within one tile) or
-        composes two tiles into scratch_buffer before blitting (boundary crossing).
-        Tile buffer pointers are currently windows into canvas_buffer; Phase 5 will
-        replace them with independent per-tile PSRAM allocations and LRU rotation.
+    Phase 4/5 - rotating tile cache (current):
+        Fixed-height document descriptors define the full virtual y-range, but only
+        three PSRAM tile bitmaps are kept resident at runtime: previous, current,
+        and next. When scroll crosses into an uncached descriptor, the least-recently
+        used bitmap is evicted and that descriptor is re-baked into the freed buffer.
+        Viewport blitting still uses the same fast path: direct blit when fully inside
+        one tile, scratch-buffer composition only when crossing a tile boundary.
 */
 
 #include "freertos/FreeRTOS.h"
@@ -90,9 +88,10 @@
 #define LCD_V_RES 536
 
 // lv_img_header_t encodes width/height in 11-bit fields: max 2047px. Silent truncation above this.
-// All canvas operations must stay within BAKE_CHUNK_HEIGHT to avoid invisible draws.
+// TILE_HEIGHT stays below that limit so every runtime tile remains safe to rasterize with LVGL.
 #define MAX_TILE_DESCRIPTORS 32 // Max tile descriptors to cover full document
 #define TILE_HEIGHT 1024        // Must exceed LCD_V_RES so most frames stay on the direct-blit fast path
+#define RUNTIME_TILE_BUFFERS 3  // Previous, current, next
 #define MAX_PARAGRAPHS 128
 #define MAX_LAYOUT_LINES 2048
 
@@ -103,8 +102,6 @@
 #define BODY_LINE_SPACE 4
 #define BODY_PARAGRAPH_GAP 18
 #define CONTENT_BOTTOM_PADDING 24
-#define BAKE_CHUNK_HEIGHT 1024 // Must stay below LVGL 11-bit header limit of 2047
-
 #define SCROLL_ACTIVE_FRAME_MS 1
 #define SCROLL_IDLE_SLEEP_MS 50
 #define SCROLL_REDRAW_THRESHOLD_PX 1
@@ -125,6 +122,8 @@ typedef struct
 {
     uint32_t start_offset;
     uint32_t end_offset;
+    int32_t y_offset;
+    uint16_t height;
 } paragraph_span_t;
 
 typedef struct
@@ -152,6 +151,7 @@ typedef struct
     uint32_t content_length;
     uint32_t paragraph_count;
     uint32_t line_count;
+    uint16_t title_height;
     int32_t total_height;
     paragraph_span_t paragraphs[MAX_PARAGRAPHS];
     wrapped_line_t lines[MAX_LAYOUT_LINES];
@@ -159,16 +159,17 @@ typedef struct
     render_tile_t tiles[MAX_TILE_DESCRIPTORS];
 } document_layout_t;
 
-// canvas_buffer: monolithic PSRAM backing store for all baked tile content.
+// tile_cache_buffers: the three real PSRAM-resident tile bitmaps used at runtime.
 // scratch_buffer: single-screen composition buffer for two-tile boundary crossings.
 
-static lv_color_t *canvas_buffer = NULL;
+static lv_color_t *tile_cache_buffers[RUNTIME_TILE_BUFFERS] = {0};
 static lv_color_t *scratch_buffer = NULL;
 static esp_lcd_panel_handle_t panel = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 static i2c_master_dev_handle_t touch_dev = NULL;
 static TaskHandle_t render_task_handle = NULL;
 static document_layout_t doc_layout = {0};
+static uint32_t tile_generation_counter = 0;
 
 static uint32_t frame_count = 0;
 static uint32_t last_frame_count = 0;
@@ -196,13 +197,27 @@ static char *copy_paragraph_text(const char *text, paragraph_span_t span)
 
 static int32_t compute_body_height(const document_layout_t *layout)
 {
-    int32_t body_height = 0;
+    if (layout->paragraph_count == 0)
+        return 0;
+
+    const paragraph_span_t *last_paragraph = &layout->paragraphs[layout->paragraph_count - 1];
+    return (last_paragraph->y_offset + last_paragraph->height) - BODY_Y;
+}
+
+static void compute_paragraph_layout(document_layout_t *layout, const char *text)
+{
+    int32_t paragraph_y = BODY_Y;
 
     for (uint32_t index = 0; index < layout->paragraph_count; index++)
     {
-        char *paragraph = copy_paragraph_text(chapter_content, layout->paragraphs[index]);
+        paragraph_span_t *paragraph_span = &layout->paragraphs[index];
+        char *paragraph = copy_paragraph_text(text, *paragraph_span);
         if (!paragraph)
-            break;
+        {
+            paragraph_span->y_offset = paragraph_y;
+            paragraph_span->height = 0;
+            continue;
+        }
 
         lv_point_t paragraph_size;
         lv_txt_get_size(&paragraph_size,
@@ -214,28 +229,16 @@ static int32_t compute_body_height(const document_layout_t *layout)
                         LV_TEXT_FLAG_NONE);
         free(paragraph);
 
-        body_height += paragraph_size.y;
-        if (index + 1 < layout->paragraph_count)
-            body_height += BODY_PARAGRAPH_GAP;
+        paragraph_span->y_offset = paragraph_y;
+        paragraph_span->height = (uint16_t)paragraph_size.y;
+        paragraph_y += paragraph_size.y + BODY_PARAGRAPH_GAP;
     }
-
-    return body_height;
 }
 
 static int32_t compute_document_height(const document_layout_t *layout)
 {
-    lv_point_t title_size;
-
-    lv_txt_get_size(&title_size,
-                    chapter_title,
-                    &lv_font_montserrat_18,
-                    0,
-                    0,
-                    CONTENT_WIDTH,
-                    LV_TEXT_FLAG_NONE);
-
     int32_t body_height = compute_body_height(layout);
-    int32_t title_bottom = TITLE_Y + title_size.y;
+    int32_t title_bottom = TITLE_Y + layout->title_height;
     int32_t body_bottom = BODY_Y + body_height + CONTENT_BOTTOM_PADDING;
     int32_t total_height = (body_bottom > title_bottom) ? body_bottom : title_bottom;
 
@@ -284,7 +287,7 @@ static void build_paragraph_index(document_layout_t *layout, const char *text)
 }
 
 // Divide the virtual document into fixed-height tile descriptors.
-// Buffer pointers remain NULL until bake_content wires them into canvas_buffer.
+// Buffer pointers remain NULL until a descriptor is baked into one of the runtime tile buffers.
 static void assign_tile_ranges(document_layout_t *layout)
 {
     layout->tile_count = 0;
@@ -309,6 +312,16 @@ static void init_document_layout(document_layout_t *layout)
 {
     memset(layout, 0, sizeof(*layout));
     build_paragraph_index(layout, chapter_content);
+    lv_point_t title_size;
+    lv_txt_get_size(&title_size,
+                    chapter_title,
+                    &lv_font_montserrat_18,
+                    0,
+                    0,
+                    CONTENT_WIDTH,
+                    LV_TEXT_FLAG_NONE);
+    layout->title_height = (uint16_t)title_size.y;
+    compute_paragraph_layout(layout, chapter_content);
     // assign_tile_ranges depends on total_height so must run after compute_document_height.
     layout->total_height = compute_document_height(layout);
     assign_tile_ranges(layout);
@@ -323,6 +336,170 @@ static int32_t find_tile_for_y(int32_t virtual_y)
             return (int32_t)i;
     }
     return -1;
+}
+
+static uint32_t count_loaded_tiles(void)
+{
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < doc_layout.tile_count; i++)
+    {
+        if (doc_layout.tiles[i].valid && doc_layout.tiles[i].buffer)
+            loaded++;
+    }
+    return loaded;
+}
+
+static lv_color_t *acquire_tile_buffer(void)
+{
+    for (uint32_t slot = 0; slot < RUNTIME_TILE_BUFFERS; slot++)
+    {
+        lv_color_t *buffer = tile_cache_buffers[slot];
+        bool in_use = false;
+
+        for (uint32_t index = 0; index < doc_layout.tile_count; index++)
+        {
+            if (doc_layout.tiles[index].valid && doc_layout.tiles[index].buffer == buffer)
+            {
+                in_use = true;
+                break;
+            }
+        }
+
+        if (!in_use)
+            return buffer;
+    }
+
+    int32_t oldest_index = -1;
+    uint32_t oldest_generation = 0;
+    for (uint32_t index = 0; index < doc_layout.tile_count; index++)
+    {
+        render_tile_t *tile = &doc_layout.tiles[index];
+        if (!tile->valid || !tile->buffer)
+            continue;
+
+        if (oldest_index < 0 || tile->generation < oldest_generation)
+        {
+            oldest_index = (int32_t)index;
+            oldest_generation = tile->generation;
+        }
+    }
+
+    if (oldest_index < 0)
+        return NULL;
+
+    lv_color_t *buffer = doc_layout.tiles[oldest_index].buffer;
+    doc_layout.tiles[oldest_index].buffer = NULL;
+    doc_layout.tiles[oldest_index].valid = false;
+    doc_layout.tiles[oldest_index].generation = 0;
+    return buffer;
+}
+
+static bool bake_tile_bitmap(render_tile_t *tile)
+{
+    if (!tile || !tile->buffer || tile->pixel_height == 0)
+        return false;
+
+    size_t tile_size = (size_t)LCD_H_RES * (size_t)tile->pixel_height * sizeof(lv_color_t);
+    memset(tile->buffer, 0, tile_size);
+
+    lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
+    if (!canvas)
+        return false;
+    lv_canvas_set_buffer(canvas, tile->buffer, LCD_H_RES, tile->pixel_height, LV_IMG_CF_TRUE_COLOR);
+
+    lv_draw_label_dsc_t title_dsc;
+    lv_draw_label_dsc_init(&title_dsc);
+    title_dsc.color = lv_color_hex(0xFF2200);
+    title_dsc.font = &lv_font_montserrat_18;
+
+    int32_t title_bottom = TITLE_Y + doc_layout.title_height;
+    if (TITLE_Y < tile->end_y && title_bottom > tile->start_y)
+    {
+        lv_canvas_draw_text(canvas,
+                            CONTENT_X_PADDING,
+                            TITLE_Y - tile->start_y,
+                            CONTENT_WIDTH,
+                            &title_dsc,
+                            chapter_title);
+    }
+
+    lv_draw_label_dsc_t body_dsc;
+    lv_draw_label_dsc_init(&body_dsc);
+    body_dsc.color = lv_color_hex(0xCC1100);
+    body_dsc.font = &lv_font_montserrat_16;
+    body_dsc.line_space = BODY_LINE_SPACE;
+
+    for (uint32_t index = 0; index < doc_layout.paragraph_count; index++)
+    {
+        paragraph_span_t paragraph_span = doc_layout.paragraphs[index];
+        char *paragraph = copy_paragraph_text(chapter_content, paragraph_span);
+        if (!paragraph)
+            break;
+
+        int32_t paragraph_bottom = paragraph_span.y_offset + paragraph_span.height;
+        if (paragraph_span.y_offset < tile->end_y && paragraph_bottom > tile->start_y)
+        {
+            lv_canvas_draw_text(canvas,
+                                CONTENT_X_PADDING,
+                                paragraph_span.y_offset - tile->start_y,
+                                CONTENT_WIDTH,
+                                &body_dsc,
+                                paragraph);
+        }
+
+        free(paragraph);
+
+        if (paragraph_span.y_offset >= tile->end_y)
+            break;
+    }
+
+    lv_obj_del(canvas);
+    tile->valid = true;
+    tile->generation = ++tile_generation_counter;
+    return true;
+}
+
+static bool ensure_tile_resident(int32_t tile_idx)
+{
+    if (tile_idx < 0 || (uint32_t)tile_idx >= doc_layout.tile_count)
+        return false;
+
+    render_tile_t *tile = &doc_layout.tiles[tile_idx];
+    if (tile->valid && tile->buffer)
+    {
+        tile->generation = ++tile_generation_counter;
+        return true;
+    }
+
+    lv_color_t *buffer = acquire_tile_buffer();
+    if (!buffer)
+        return false;
+
+    for (uint32_t index = 0; index < doc_layout.tile_count; index++)
+    {
+        if ((int32_t)index == tile_idx)
+            continue;
+        if (doc_layout.tiles[index].buffer == buffer)
+        {
+            doc_layout.tiles[index].buffer = NULL;
+            doc_layout.tiles[index].valid = false;
+            doc_layout.tiles[index].generation = 0;
+        }
+    }
+
+    tile->buffer = buffer;
+    return bake_tile_bitmap(tile);
+}
+
+static void prefetch_neighbor_tiles(int32_t center_tile_idx, int32_t direction)
+{
+    int32_t primary_idx = center_tile_idx + direction;
+    int32_t secondary_idx = center_tile_idx - direction;
+
+    if (primary_idx >= 0 && (uint32_t)primary_idx < doc_layout.tile_count)
+        ensure_tile_resident(primary_idx);
+    if (secondary_idx >= 0 && (uint32_t)secondary_idx < doc_layout.tile_count)
+        ensure_tile_resident(secondary_idx);
 }
 
 IRAM_ATTR static bool flush_ready_cb(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx)
@@ -396,7 +573,8 @@ IRAM_ATTR static void render_task(void *arg)
             last_touch_y = 0;
         }
 
-        int32_t delta_scroll = scroll_y - last_blit_scroll_y;
+        int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (scroll_y - last_blit_scroll_y);
+        int32_t delta_scroll = scroll_step;
         if (delta_scroll < 0)
             delta_scroll = -delta_scroll;
 
@@ -404,7 +582,7 @@ IRAM_ATTR static void render_task(void *arg)
         if (is_rendering_baked && scratch_buffer && !spi_bus_busy && should_redraw)
         {
             int32_t tile_idx = find_tile_for_y(scroll_y);
-            if (tile_idx >= 0 && doc_layout.tiles[tile_idx].valid)
+            if (tile_idx >= 0 && ensure_tile_resident(tile_idx))
             {
                 spi_bus_busy = true;
                 render_tile_t *tile = &doc_layout.tiles[tile_idx];
@@ -420,14 +598,20 @@ IRAM_ATTR static void render_task(void *arg)
                 {
                     // Boundary path: viewport crosses two tiles.
                     // Compose both halves into scratch_buffer then blit in one call.
+                    int32_t next_idx = find_tile_for_y(tile->end_y);
+                    if (next_idx < 0 || !ensure_tile_resident(next_idx))
+                    {
+                        spi_bus_busy = false;
+                        goto render_wait;
+                    }
+
                     int32_t rows_from_current = tile->end_y - scroll_y;
                     memcpy(scratch_buffer,
                            &tile->buffer[(scroll_y - tile->start_y) * LCD_H_RES],
                            (size_t)rows_from_current * LCD_H_RES * sizeof(lv_color_t));
 
-                    int32_t next_idx = find_tile_for_y(tile->end_y);
                     int32_t rows_from_next = LCD_V_RES - rows_from_current;
-                    if (next_idx >= 0 && doc_layout.tiles[next_idx].valid)
+                    if (doc_layout.tiles[next_idx].valid)
                     {
                         memcpy(&scratch_buffer[rows_from_current * LCD_H_RES],
                                doc_layout.tiles[next_idx].buffer,
@@ -443,9 +627,13 @@ IRAM_ATTR static void render_task(void *arg)
                 }
                 last_blit_scroll_y = scroll_y;
                 frame_count++;
+
+                // Keep the direction of travel warm so crossing into the next tile does not stall.
+                prefetch_neighbor_tiles(tile_idx, (scroll_step < 0) ? -1 : 1);
             }
         }
 
+    render_wait:
         uint32_t wait_ms = is_touching ? SCROLL_ACTIVE_FRAME_MS : SCROLL_IDLE_SLEEP_MS;
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
@@ -477,10 +665,11 @@ static void stats_task(void *arg)
 
         printf("\n--- SYSTEM AUDIT ---\n");
         printf("Performance: %.1f FPS | Bus Load: %.1f%%\n", real_fps, bus_load);
-        printf("Content: %lu bytes | Paragraphs: %lu | Height: %ld px | Tiles: %lu\n",
+        printf("Content: %lu bytes | Paragraphs: %lu | Height: %ld px | Tiles: %lu/%lu loaded\n",
                (unsigned long)doc_layout.content_length,
                (unsigned long)doc_layout.paragraph_count,
                (long)doc_layout.total_height,
+               (unsigned long)count_loaded_tiles(),
                (unsigned long)doc_layout.tile_count);
 
         vTaskGetRunTimeStats(stats_buf);
@@ -489,64 +678,21 @@ static void stats_task(void *arg)
     }
 }
 
-// Draw text into a region of canvas_buffer starting at pixel row start_y.
-// Each call uses a small canvas chunk to stay below LVGL's 2047px header limit.
-static void bake_draw_at(lv_draw_label_dsc_t *dsc, int32_t start_y,
-                         lv_coord_t x, const char *text)
-{
-    int32_t remaining = doc_layout.total_height - start_y;
-    if (remaining <= 0)
-        return;
-
-    lv_coord_t chunk_h = (lv_coord_t)((remaining > BAKE_CHUNK_HEIGHT) ? BAKE_CHUNK_HEIGHT : remaining);
-    lv_color_t *chunk_buf = &canvas_buffer[start_y * LCD_H_RES];
-
-    lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
-    lv_canvas_set_buffer(canvas, chunk_buf, LCD_H_RES, chunk_h, LV_IMG_CF_TRUE_COLOR);
-    // y=0 within this chunk because the buffer pointer is already offset to start_y
-    lv_canvas_draw_text(canvas, x, 0, CONTENT_WIDTH, dsc, text);
-    lv_obj_del(canvas);
-}
-
 static void bake_content(void)
 {
-    size_t sz = (size_t)LCD_H_RES * (size_t)doc_layout.total_height * sizeof(lv_color_t);
-    canvas_buffer = heap_caps_aligned_alloc(64, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    if (!canvas_buffer)
+    size_t tile_buffer_size = (size_t)LCD_H_RES * TILE_HEIGHT * sizeof(lv_color_t);
+    for (uint32_t slot = 0; slot < RUNTIME_TILE_BUFFERS; slot++)
     {
-        printf("Failed to allocate canvas buffer (%u bytes)\n", (unsigned)sz);
-        return;
-    }
-    // Black background via memset (0x0000 = black in RGB565).
-    // No lv_canvas_fill_bg needed — avoids the 2047px limit on a fill of the full buffer.
-    memset(canvas_buffer, 0, sz);
-
-    lv_draw_label_dsc_t label_dsc;
-    lv_draw_label_dsc_init(&label_dsc);
-
-    // Title
-    label_dsc.color = lv_color_hex(0xFF2200);
-    label_dsc.font = &lv_font_montserrat_18;
-    bake_draw_at(&label_dsc, TITLE_Y, CONTENT_X_PADDING, chapter_title);
-
-    // Body paragraphs, each drawn into its own chunk window
-    int32_t body_y = BODY_Y;
-    label_dsc.color = lv_color_hex(0xCC1100);
-    label_dsc.font = &lv_font_montserrat_16;
-    label_dsc.line_space = BODY_LINE_SPACE;
-    for (uint32_t index = 0; index < doc_layout.paragraph_count; index++)
-    {
-        char *paragraph = copy_paragraph_text(chapter_content, doc_layout.paragraphs[index]);
-        if (!paragraph)
-            break;
-
-        lv_point_t paragraph_size;
-        lv_txt_get_size(&paragraph_size, paragraph, label_dsc.font,
-                        0, label_dsc.line_space, CONTENT_WIDTH, LV_TEXT_FLAG_NONE);
-
-        bake_draw_at(&label_dsc, body_y, CONTENT_X_PADDING, paragraph);
-        body_y += paragraph_size.y + BODY_PARAGRAPH_GAP;
-        free(paragraph);
+        tile_cache_buffers[slot] = heap_caps_aligned_alloc(64,
+                                                           tile_buffer_size,
+                                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        if (!tile_cache_buffers[slot])
+        {
+            printf("Failed to allocate tile buffer %lu (%u bytes)\n",
+                   (unsigned long)slot,
+                   (unsigned)tile_buffer_size);
+            return;
+        }
     }
 
     // Allocate the scratch buffer for two-tile boundary composition (one screen frame).
@@ -559,17 +705,15 @@ static void bake_content(void)
         return;
     }
 
-    // Wire tile descriptors as offset windows into canvas_buffer.
-    // Phase 5 will replace these with independent per-tile allocations + rotation.
-    for (uint32_t i = 0; i < doc_layout.tile_count; i++)
-    {
-        doc_layout.tiles[i].buffer = &canvas_buffer[doc_layout.tiles[i].start_y * LCD_H_RES];
-        doc_layout.tiles[i].valid = true;
-    }
+    // Warm the opening viewport and its immediate neighbors.
+    ensure_tile_resident(0);
+    ensure_tile_resident(1);
+    ensure_tile_resident(2);
 
-    printf("Tiles: %lu covering %ld px (%u px/tile)\n",
+    printf("Tiles: %lu descriptors over %ld px | %u resident buffers of %u px\n",
            (unsigned long)doc_layout.tile_count,
            (long)doc_layout.total_height,
+           (unsigned)RUNTIME_TILE_BUFFERS,
            (unsigned)TILE_HEIGHT);
 
     is_rendering_baked = true;
