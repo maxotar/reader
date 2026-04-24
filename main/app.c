@@ -26,6 +26,42 @@
         - Tile-based rendering of large documents
         - Cached rasterized text regions for reuse during scroll
 */
+/*
+    Implementation notes and key learnings:
+
+        LVGL 11-bit canvas limit:
+            lv_img_header_t stores canvas width/height in 11-bit fields (max 2047px).
+            Any canvas taller than 2047px is silently truncated; all text draws beyond
+            that pixel row produce no output and no error. Fixed by using
+            BAKE_CHUNK_HEIGHT canvas windows that offset directly into the PSRAM
+            buffer, keeping every individual canvas safely under 2047px.
+
+        Display context ordering:
+            lv_txt_get_size requires a registered LVGL display to resolve font metrics.
+            Calling it before lv_disp_drv_register returns zero dimensions, collapsing
+            all computed paragraph heights and causing a black screen.
+            Fixed: init_document_layout must be called after lv_disp_drv_register.
+
+        Event-driven rendering:
+            A fixed-rate render loop wastes CPU at idle. Switching to a delta-gated
+            redraw (only blit when scroll_y changed) plus adaptive vTaskDelay
+            (8 ms active / 50 ms idle) keeps idle CPU near zero while delivering
+            target FPS during scroll.
+
+        Touch I2C fail-safe:
+            If the FT3168 I2C read fails, is_touching must be cleared to false.
+            Leaving it stale keeps the render task in 8 ms active pacing indefinitely,
+            blocking the return to the 50 ms idle sleep and burning CPU.
+
+    Phase 3 - tile-based rendering (current):
+        The monolithic canvas_buffer is logically divided into fixed-height tile
+        descriptors. Each render_tile_t holds a buffer pointer, y-range, and a
+        valid flag. Viewport blitting uses find_tile_for_y to locate the correct
+        tile, then either blits directly (fast path: viewport within one tile) or
+        composes two tiles into scratch_buffer before blitting (boundary crossing).
+        Tile buffer pointers are currently windows into canvas_buffer; Phase 5 will
+        replace them with independent per-tile PSRAM allocations and LRU rotation.
+*/
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -52,9 +88,24 @@
 
 #define LCD_H_RES 240
 #define LCD_V_RES 536
-#define CANVAS_HEIGHT 4000
 
-#define SCROLL_ACTIVE_FRAME_MS 8
+// lv_img_header_t encodes width/height in 11-bit fields: max 2047px. Silent truncation above this.
+// All canvas operations must stay within BAKE_CHUNK_HEIGHT to avoid invisible draws.
+#define MAX_TILE_DESCRIPTORS 32 // Max tile descriptors to cover full document
+#define TILE_HEIGHT 1024        // Must exceed LCD_V_RES so most frames stay on the direct-blit fast path
+#define MAX_PARAGRAPHS 128
+#define MAX_LAYOUT_LINES 2048
+
+#define CONTENT_X_PADDING 14
+#define CONTENT_WIDTH (LCD_H_RES - (CONTENT_X_PADDING * 2))
+#define TITLE_Y 20
+#define BODY_Y 80
+#define BODY_LINE_SPACE 4
+#define BODY_PARAGRAPH_GAP 18
+#define CONTENT_BOTTOM_PADDING 24
+#define BAKE_CHUNK_HEIGHT 1024 // Must stay below LVGL 11-bit header limit of 2047
+
+#define SCROLL_ACTIVE_FRAME_MS 1
 #define SCROLL_IDLE_SLEEP_MS 50
 #define SCROLL_REDRAW_THRESHOLD_PX 1
 #define TOUCH_POLL_MS 5
@@ -70,10 +121,54 @@ static volatile bool is_touching = false;
 static volatile bool spi_bus_busy = false;
 static volatile bool is_rendering_baked = false;
 
+typedef struct
+{
+    uint32_t start_offset;
+    uint32_t end_offset;
+} paragraph_span_t;
+
+typedef struct
+{
+    uint32_t start_offset;
+    uint32_t end_offset;
+    int32_t y_offset;
+    uint16_t height;
+} wrapped_line_t;
+
+typedef struct
+{
+    lv_color_t *buffer;
+    uint16_t pixel_height;
+    uint32_t start_line;
+    uint32_t end_line;
+    int32_t start_y;
+    int32_t end_y;
+    uint32_t generation;
+    bool valid;
+} render_tile_t;
+
+typedef struct
+{
+    uint32_t content_length;
+    uint32_t paragraph_count;
+    uint32_t line_count;
+    int32_t total_height;
+    paragraph_span_t paragraphs[MAX_PARAGRAPHS];
+    wrapped_line_t lines[MAX_LAYOUT_LINES];
+    uint32_t tile_count; // Number of tile descriptors covering total_height
+    render_tile_t tiles[MAX_TILE_DESCRIPTORS];
+} document_layout_t;
+
+// canvas_buffer: monolithic PSRAM backing store for all baked tile content.
+// scratch_buffer: single-screen composition buffer for two-tile boundary crossings.
+
 static lv_color_t *canvas_buffer = NULL;
+static lv_color_t *scratch_buffer = NULL;
 static esp_lcd_panel_handle_t panel = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 static i2c_master_dev_handle_t touch_dev = NULL;
+static TaskHandle_t render_task_handle = NULL;
+static document_layout_t doc_layout = {0};
 
 static uint32_t frame_count = 0;
 static uint32_t last_frame_count = 0;
@@ -86,6 +181,149 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x29, (uint8_t[]){0x00}, 0, 10},
     {0x51, (uint8_t[]){0xFF}, 1, 0},
 };
+
+static char *copy_paragraph_text(const char *text, paragraph_span_t span)
+{
+    size_t len = span.end_offset - span.start_offset;
+    char *buffer = malloc(len + 1);
+    if (!buffer)
+        return NULL;
+
+    memcpy(buffer, text + span.start_offset, len);
+    buffer[len] = '\0';
+    return buffer;
+}
+
+static int32_t compute_body_height(const document_layout_t *layout)
+{
+    int32_t body_height = 0;
+
+    for (uint32_t index = 0; index < layout->paragraph_count; index++)
+    {
+        char *paragraph = copy_paragraph_text(chapter_content, layout->paragraphs[index]);
+        if (!paragraph)
+            break;
+
+        lv_point_t paragraph_size;
+        lv_txt_get_size(&paragraph_size,
+                        paragraph,
+                        &lv_font_montserrat_16,
+                        0,
+                        BODY_LINE_SPACE,
+                        CONTENT_WIDTH,
+                        LV_TEXT_FLAG_NONE);
+        free(paragraph);
+
+        body_height += paragraph_size.y;
+        if (index + 1 < layout->paragraph_count)
+            body_height += BODY_PARAGRAPH_GAP;
+    }
+
+    return body_height;
+}
+
+static int32_t compute_document_height(const document_layout_t *layout)
+{
+    lv_point_t title_size;
+
+    lv_txt_get_size(&title_size,
+                    chapter_title,
+                    &lv_font_montserrat_18,
+                    0,
+                    0,
+                    CONTENT_WIDTH,
+                    LV_TEXT_FLAG_NONE);
+
+    int32_t body_height = compute_body_height(layout);
+    int32_t title_bottom = TITLE_Y + title_size.y;
+    int32_t body_bottom = BODY_Y + body_height + CONTENT_BOTTOM_PADDING;
+    int32_t total_height = (body_bottom > title_bottom) ? body_bottom : title_bottom;
+
+    return (total_height > LCD_V_RES) ? total_height : LCD_V_RES;
+}
+
+static void build_paragraph_index(document_layout_t *layout, const char *text)
+{
+    const char *paragraph_start = text;
+    const char *cursor = text;
+
+    layout->paragraph_count = 0;
+    layout->content_length = (uint32_t)strlen(text);
+
+    while (*cursor && layout->paragraph_count < MAX_PARAGRAPHS)
+    {
+        bool at_boundary = (cursor[0] == '\n' && cursor[1] == '\n');
+        if (at_boundary)
+        {
+            if (cursor > paragraph_start)
+            {
+                paragraph_span_t *span = &layout->paragraphs[layout->paragraph_count++];
+                span->start_offset = (uint32_t)(paragraph_start - text);
+                span->end_offset = (uint32_t)(cursor - text);
+            }
+
+            if (at_boundary)
+            {
+                cursor += 2;
+                paragraph_start = cursor;
+                continue;
+            }
+        }
+
+        if (*cursor == '\0')
+            break;
+        cursor++;
+    }
+
+    if (paragraph_start < cursor && layout->paragraph_count < MAX_PARAGRAPHS)
+    {
+        paragraph_span_t *span = &layout->paragraphs[layout->paragraph_count++];
+        span->start_offset = (uint32_t)(paragraph_start - text);
+        span->end_offset = (uint32_t)(cursor - text);
+    }
+}
+
+// Divide the virtual document into fixed-height tile descriptors.
+// Buffer pointers remain NULL until bake_content wires them into canvas_buffer.
+static void assign_tile_ranges(document_layout_t *layout)
+{
+    layout->tile_count = 0;
+    int32_t y = 0;
+    while (y < layout->total_height && layout->tile_count < MAX_TILE_DESCRIPTORS)
+    {
+        render_tile_t *tile = &layout->tiles[layout->tile_count];
+        tile->start_y = y;
+        tile->end_y = y + TILE_HEIGHT;
+        if (tile->end_y > layout->total_height)
+            tile->end_y = layout->total_height;
+        tile->pixel_height = (uint16_t)(tile->end_y - tile->start_y);
+        tile->buffer = NULL;
+        tile->valid = false;
+        tile->generation = 0;
+        layout->tile_count++;
+        y += TILE_HEIGHT;
+    }
+}
+
+static void init_document_layout(document_layout_t *layout)
+{
+    memset(layout, 0, sizeof(*layout));
+    build_paragraph_index(layout, chapter_content);
+    // assign_tile_ranges depends on total_height so must run after compute_document_height.
+    layout->total_height = compute_document_height(layout);
+    assign_tile_ranges(layout);
+}
+
+// Returns the tile index whose y-range covers virtual_y, or -1 if not found.
+static int32_t find_tile_for_y(int32_t virtual_y)
+{
+    for (uint32_t i = 0; i < doc_layout.tile_count; i++)
+    {
+        if (virtual_y >= doc_layout.tiles[i].start_y && virtual_y < doc_layout.tiles[i].end_y)
+            return (int32_t)i;
+    }
+    return -1;
+}
 
 IRAM_ATTR static bool flush_ready_cb(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx)
 {
@@ -100,20 +338,30 @@ static void touch_poll_task(void *arg)
 {
     (void)arg;
     uint8_t reg = 0x02, data[6];
+    bool last_touching = false;
+    uint16_t last_touch_sample = 0;
     while (1)
     {
+        bool next_touching = false;
+        uint16_t next_touch_y = 0;
         if (i2c_master_transmit_receive(touch_dev, &reg, 1, data, 6, pdMS_TO_TICKS(TOUCH_POLL_MS)) == ESP_OK)
         {
-            is_touching = (data[0] & 0x0F) > 0;
-            if (is_touching)
-            {
-                touch_y = ((data[3] & 0x0F) << 8) | data[4];
-            }
+            next_touching = (data[0] & 0x0F) > 0;
+            if (next_touching)
+                next_touch_y = ((data[3] & 0x0F) << 8) | data[4];
         }
-        else
+
+        is_touching = next_touching;
+        touch_y = next_touch_y;
+
+        if (render_task_handle &&
+            ((next_touching != last_touching) || (next_touching && next_touch_y != last_touch_sample)))
         {
-            is_touching = false;
+            xTaskNotifyGive(render_task_handle);
         }
+
+        last_touching = next_touching;
+        last_touch_sample = next_touch_y;
         vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
     }
 }
@@ -121,14 +369,16 @@ static void touch_poll_task(void *arg)
 IRAM_ATTR static void render_task(void *arg)
 {
     (void)arg;
+    render_task_handle = xTaskGetCurrentTaskHandle();
     uint16_t last_touch_y = 0;
     int32_t last_blit_scroll_y = -1;
-    int32_t max_scroll_y = CANVAS_HEIGHT - LCD_V_RES;
-    if (max_scroll_y < 0)
-        max_scroll_y = 0;
 
     while (1)
     {
+        int32_t max_scroll_y = doc_layout.total_height - LCD_V_RES;
+        if (max_scroll_y < 0)
+            max_scroll_y = 0;
+
         if (is_touching)
         {
             if (last_touch_y != 0)
@@ -151,23 +401,53 @@ IRAM_ATTR static void render_task(void *arg)
             delta_scroll = -delta_scroll;
 
         bool should_redraw = (last_blit_scroll_y < 0) || (delta_scroll >= SCROLL_REDRAW_THRESHOLD_PX);
-        if (is_rendering_baked && canvas_buffer && !spi_bus_busy && should_redraw)
+        if (is_rendering_baked && scratch_buffer && !spi_bus_busy && should_redraw)
         {
-            spi_bus_busy = true;
-            lv_color_t *ptr = &canvas_buffer[scroll_y * LCD_H_RES];
-            esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, ptr);
-            last_blit_scroll_y = scroll_y;
-            frame_count++;
+            int32_t tile_idx = find_tile_for_y(scroll_y);
+            if (tile_idx >= 0 && doc_layout.tiles[tile_idx].valid)
+            {
+                spi_bus_busy = true;
+                render_tile_t *tile = &doc_layout.tiles[tile_idx];
+                int32_t viewport_end_y = scroll_y + LCD_V_RES;
+
+                if (viewport_end_y <= tile->end_y)
+                {
+                    // Fast path: viewport is fully within one tile, blit directly.
+                    lv_color_t *ptr = &tile->buffer[(scroll_y - tile->start_y) * LCD_H_RES];
+                    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, ptr);
+                }
+                else
+                {
+                    // Boundary path: viewport crosses two tiles.
+                    // Compose both halves into scratch_buffer then blit in one call.
+                    int32_t rows_from_current = tile->end_y - scroll_y;
+                    memcpy(scratch_buffer,
+                           &tile->buffer[(scroll_y - tile->start_y) * LCD_H_RES],
+                           (size_t)rows_from_current * LCD_H_RES * sizeof(lv_color_t));
+
+                    int32_t next_idx = find_tile_for_y(tile->end_y);
+                    int32_t rows_from_next = LCD_V_RES - rows_from_current;
+                    if (next_idx >= 0 && doc_layout.tiles[next_idx].valid)
+                    {
+                        memcpy(&scratch_buffer[rows_from_current * LCD_H_RES],
+                               doc_layout.tiles[next_idx].buffer,
+                               (size_t)rows_from_next * LCD_H_RES * sizeof(lv_color_t));
+                    }
+                    else
+                    {
+                        // Next tile not yet available; fill remainder black.
+                        memset(&scratch_buffer[rows_from_current * LCD_H_RES], 0,
+                               (size_t)rows_from_next * LCD_H_RES * sizeof(lv_color_t));
+                    }
+                    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, scratch_buffer);
+                }
+                last_blit_scroll_y = scroll_y;
+                frame_count++;
+            }
         }
 
-        if (is_touching)
-        {
-            vTaskDelay(pdMS_TO_TICKS(SCROLL_ACTIVE_FRAME_MS));
-        }
-        else
-        {
-            vTaskDelay(pdMS_TO_TICKS(SCROLL_IDLE_SLEEP_MS));
-        }
+        uint32_t wait_ms = is_touching ? SCROLL_ACTIVE_FRAME_MS : SCROLL_IDLE_SLEEP_MS;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
 }
 
@@ -197,6 +477,11 @@ static void stats_task(void *arg)
 
         printf("\n--- SYSTEM AUDIT ---\n");
         printf("Performance: %.1f FPS | Bus Load: %.1f%%\n", real_fps, bus_load);
+        printf("Content: %lu bytes | Paragraphs: %lu | Height: %ld px | Tiles: %lu\n",
+               (unsigned long)doc_layout.content_length,
+               (unsigned long)doc_layout.paragraph_count,
+               (long)doc_layout.total_height,
+               (unsigned long)doc_layout.tile_count);
 
         vTaskGetRunTimeStats(stats_buf);
         printf("Task Load:\n%s", stats_buf);
@@ -204,33 +489,89 @@ static void stats_task(void *arg)
     }
 }
 
+// Draw text into a region of canvas_buffer starting at pixel row start_y.
+// Each call uses a small canvas chunk to stay below LVGL's 2047px header limit.
+static void bake_draw_at(lv_draw_label_dsc_t *dsc, int32_t start_y,
+                         lv_coord_t x, const char *text)
+{
+    int32_t remaining = doc_layout.total_height - start_y;
+    if (remaining <= 0)
+        return;
+
+    lv_coord_t chunk_h = (lv_coord_t)((remaining > BAKE_CHUNK_HEIGHT) ? BAKE_CHUNK_HEIGHT : remaining);
+    lv_color_t *chunk_buf = &canvas_buffer[start_y * LCD_H_RES];
+
+    lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
+    lv_canvas_set_buffer(canvas, chunk_buf, LCD_H_RES, chunk_h, LV_IMG_CF_TRUE_COLOR);
+    // y=0 within this chunk because the buffer pointer is already offset to start_y
+    lv_canvas_draw_text(canvas, x, 0, CONTENT_WIDTH, dsc, text);
+    lv_obj_del(canvas);
+}
+
 static void bake_content(void)
 {
-    size_t sz = LCD_H_RES * CANVAS_HEIGHT * sizeof(lv_color_t);
+    size_t sz = (size_t)LCD_H_RES * (size_t)doc_layout.total_height * sizeof(lv_color_t);
     canvas_buffer = heap_caps_aligned_alloc(64, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (!canvas_buffer)
     {
         printf("Failed to allocate canvas buffer (%u bytes)\n", (unsigned)sz);
         return;
     }
+    // Black background via memset (0x0000 = black in RGB565).
+    // No lv_canvas_fill_bg needed — avoids the 2047px limit on a fill of the full buffer.
     memset(canvas_buffer, 0, sz);
-
-    lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
-    lv_canvas_set_buffer(canvas, canvas_buffer, LCD_H_RES, CANVAS_HEIGHT, LV_IMG_CF_TRUE_COLOR);
-    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
 
     lv_draw_label_dsc_t label_dsc;
     lv_draw_label_dsc_init(&label_dsc);
+
+    // Title
     label_dsc.color = lv_color_hex(0xFF2200);
     label_dsc.font = &lv_font_montserrat_18;
-    lv_canvas_draw_text(canvas, 14, 20, LCD_H_RES - 28, &label_dsc, chapter_title);
+    bake_draw_at(&label_dsc, TITLE_Y, CONTENT_X_PADDING, chapter_title);
 
+    // Body paragraphs, each drawn into its own chunk window
+    int32_t body_y = BODY_Y;
     label_dsc.color = lv_color_hex(0xCC1100);
     label_dsc.font = &lv_font_montserrat_16;
-    label_dsc.line_space = 4;
-    lv_canvas_draw_text(canvas, 14, 80, LCD_H_RES - 28, &label_dsc, chapter_content);
+    label_dsc.line_space = BODY_LINE_SPACE;
+    for (uint32_t index = 0; index < doc_layout.paragraph_count; index++)
+    {
+        char *paragraph = copy_paragraph_text(chapter_content, doc_layout.paragraphs[index]);
+        if (!paragraph)
+            break;
 
-    lv_obj_del(canvas);
+        lv_point_t paragraph_size;
+        lv_txt_get_size(&paragraph_size, paragraph, label_dsc.font,
+                        0, label_dsc.line_space, CONTENT_WIDTH, LV_TEXT_FLAG_NONE);
+
+        bake_draw_at(&label_dsc, body_y, CONTENT_X_PADDING, paragraph);
+        body_y += paragraph_size.y + BODY_PARAGRAPH_GAP;
+        free(paragraph);
+    }
+
+    // Allocate the scratch buffer for two-tile boundary composition (one screen frame).
+    scratch_buffer = heap_caps_aligned_alloc(64,
+                                             (size_t)LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!scratch_buffer)
+    {
+        printf("bake_content: failed to allocate scratch buffer\n");
+        return;
+    }
+
+    // Wire tile descriptors as offset windows into canvas_buffer.
+    // Phase 5 will replace these with independent per-tile allocations + rotation.
+    for (uint32_t i = 0; i < doc_layout.tile_count; i++)
+    {
+        doc_layout.tiles[i].buffer = &canvas_buffer[doc_layout.tiles[i].start_y * LCD_H_RES];
+        doc_layout.tiles[i].valid = true;
+    }
+
+    printf("Tiles: %lu covering %ld px (%u px/tile)\n",
+           (unsigned long)doc_layout.tile_count,
+           (long)doc_layout.total_height,
+           (unsigned)TILE_HEIGHT);
+
     is_rendering_baked = true;
 }
 
@@ -289,6 +630,13 @@ void app_main(void)
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.draw_buf = &dbuf;
     lv_disp_drv_register(&disp_drv);
+
+    // init_document_layout must run after lv_disp_drv_register so that
+    // lv_txt_get_size has a valid display context for font metrics.
+    init_document_layout(&doc_layout);
+    printf("Document layout: %lu paragraphs, virtual height %ld px\n",
+           (unsigned long)doc_layout.paragraph_count,
+           (long)doc_layout.total_height);
 
     bake_content();
 
