@@ -33,14 +33,13 @@
 #include "driver/i2c_master.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "esp_log.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_sh8601.h"
 #include "lvgl.h"
 #include "content.h"
-
-static const char *TAG = "reader";
+#include <stdio.h>
+#include <string.h>
 
 #define LCD_HOST SPI2_HOST
 #define PIN_NUM_SCLK 47
@@ -54,6 +53,11 @@ static const char *TAG = "reader";
 #define LCD_H_RES 240
 #define LCD_V_RES 536
 #define CANVAS_HEIGHT 4000
+
+#define SCROLL_ACTIVE_FRAME_MS 8
+#define SCROLL_IDLE_SLEEP_MS 50
+#define SCROLL_REDRAW_THRESHOLD_PX 1
+#define TOUCH_POLL_MS 5
 
 #define I2C_MASTER_SCL_IO 39
 #define I2C_MASTER_SDA_IO 40
@@ -70,7 +74,6 @@ static lv_color_t *canvas_buffer = NULL;
 static esp_lcd_panel_handle_t panel = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 static i2c_master_dev_handle_t touch_dev = NULL;
-static lv_disp_drv_t disp_drv;
 
 static uint32_t frame_count = 0;
 static uint32_t last_frame_count = 0;
@@ -86,19 +89,20 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
 
 IRAM_ATTR static bool flush_ready_cb(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx)
 {
+    (void)io;
+    (void)edata;
+    (void)ctx;
     spi_bus_busy = false;
-    lv_disp_flush_ready(&disp_drv);
     return false;
 }
 
-static void tick_cb(void *arg) { lv_tick_inc(1); }
-
 static void touch_poll_task(void *arg)
 {
+    (void)arg;
     uint8_t reg = 0x02, data[6];
     while (1)
     {
-        if (i2c_master_transmit_receive(touch_dev, &reg, 1, data, 6, pdMS_TO_TICKS(10)) == ESP_OK)
+        if (i2c_master_transmit_receive(touch_dev, &reg, 1, data, 6, pdMS_TO_TICKS(TOUCH_POLL_MS)) == ESP_OK)
         {
             is_touching = (data[0] & 0x0F) > 0;
             if (is_touching)
@@ -106,15 +110,20 @@ static void touch_poll_task(void *arg)
                 touch_y = ((data[3] & 0x0F) << 8) | data[4];
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        else
+        {
+            is_touching = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
     }
 }
 
 IRAM_ATTR static void render_task(void *arg)
 {
+    (void)arg;
     uint16_t last_touch_y = 0;
+    int32_t last_blit_scroll_y = -1;
     int32_t max_scroll_y = CANVAS_HEIGHT - LCD_V_RES;
-    TickType_t xLastWakeTime = xTaskGetTickCount();
     if (max_scroll_y < 0)
         max_scroll_y = 0;
 
@@ -137,20 +146,35 @@ IRAM_ATTR static void render_task(void *arg)
             last_touch_y = 0;
         }
 
-        if (is_rendering_baked && canvas_buffer && !spi_bus_busy)
+        int32_t delta_scroll = scroll_y - last_blit_scroll_y;
+        if (delta_scroll < 0)
+            delta_scroll = -delta_scroll;
+
+        bool should_redraw = (last_blit_scroll_y < 0) || (delta_scroll >= SCROLL_REDRAW_THRESHOLD_PX);
+        if (is_rendering_baked && canvas_buffer && !spi_bus_busy && should_redraw)
         {
             spi_bus_busy = true;
             lv_color_t *ptr = &canvas_buffer[scroll_y * LCD_H_RES];
             esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, ptr);
+            last_blit_scroll_y = scroll_y;
             frame_count++;
         }
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(16));
+
+        if (is_touching)
+        {
+            vTaskDelay(pdMS_TO_TICKS(SCROLL_ACTIVE_FRAME_MS));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(SCROLL_IDLE_SLEEP_MS));
+        }
     }
 }
 
 static void stats_task(void *arg)
 {
-    char *stats_buf = malloc(1024);
+    (void)arg;
+    static char stats_buf[1024];
     int64_t last_time = esp_timer_get_time();
     last_frame_count = frame_count;
 
@@ -174,11 +198,8 @@ static void stats_task(void *arg)
         printf("\n--- SYSTEM AUDIT ---\n");
         printf("Performance: %.1f FPS | Bus Load: %.1f%%\n", real_fps, bus_load);
 
-        if (stats_buf)
-        {
-            vTaskGetRunTimeStats(stats_buf);
-            printf("Task Load:\n%s", stats_buf);
-        }
+        vTaskGetRunTimeStats(stats_buf);
+        printf("Task Load:\n%s", stats_buf);
         printf("----------------------------------------\n");
     }
 }
@@ -187,6 +208,11 @@ static void bake_content(void)
 {
     size_t sz = LCD_H_RES * CANVAS_HEIGHT * sizeof(lv_color_t);
     canvas_buffer = heap_caps_aligned_alloc(64, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!canvas_buffer)
+    {
+        printf("Failed to allocate canvas buffer (%u bytes)\n", (unsigned)sz);
+        return;
+    }
     memset(canvas_buffer, 0, sz);
 
     lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
@@ -250,18 +276,19 @@ void app_main(void)
     lv_init();
 
     static lv_disp_draw_buf_t dbuf;
+    static lv_disp_drv_t disp_drv;
     lv_color_t *b1 = heap_caps_aligned_alloc(64, LCD_H_RES * 40 * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!b1)
+    {
+        printf("Failed to allocate LVGL draw buffer\n");
+        return;
+    }
     lv_disp_draw_buf_init(&dbuf, b1, NULL, LCD_H_RES * 40);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
     disp_drv.ver_res = LCD_V_RES;
     disp_drv.draw_buf = &dbuf;
     lv_disp_drv_register(&disp_drv);
-
-    const esp_timer_create_args_t t_args = {.callback = tick_cb};
-    esp_timer_handle_t timer;
-    esp_timer_create(&t_args, &timer);
-    esp_timer_start_periodic(timer, 1000);
 
     bake_content();
 
