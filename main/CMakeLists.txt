@@ -14,5 +14,5 @@ idf_component_register(
         "reader_theme.c"
         ${READER_GENERATED_FONT_SRCS}
     INCLUDE_DIRS "."
-    REQUIRES driver esp_lcd freertos esp_timer lvgl
+    REQUIRES driver esp_lcd freertos esp_timer lvgl nvs_flash
 )

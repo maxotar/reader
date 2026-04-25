@@ -11,6 +11,7 @@
 
 #include "document_layout.h"
 #include "tile_cache.h"
+#include "reader_menu.h"
 
 typedef struct
 {
@@ -21,9 +22,13 @@ typedef struct
     volatile bool *spi_bus_busy;
     volatile bool *is_rendering_baked;
     volatile bool *menu_open;
+    volatile bool *chapter_list_open;
+    volatile int32_t *chapter_list_scroll_offset;
     volatile bool *needs_layout_rebuild;
     void (*layout_rebuild_fn)(void *user_ctx);
     void *layout_rebuild_user_ctx;
+    void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out);
+    void *menu_state_user_ctx;
     TaskHandle_t *render_task_handle;
     uint32_t *frame_count;
     lv_color_t **scratch_buffer;
@@ -40,9 +45,13 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile bool *spi_bus_busy,
                                  volatile bool *is_rendering_baked,
                                  volatile bool *menu_open,
+                                 volatile bool *chapter_list_open,
+                                 volatile int32_t *chapter_list_scroll_offset,
                                  volatile bool *needs_layout_rebuild,
                                  void (*layout_rebuild_fn)(void *user_ctx),
                                  void *layout_rebuild_user_ctx,
+                                 void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out),
+                                 void *menu_state_user_ctx,
                                  TaskHandle_t *render_task_handle,
                                  uint32_t *frame_count,
                                  lv_color_t **scratch_buffer,

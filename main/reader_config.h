@@ -32,7 +32,7 @@
 #define TOUCH_POLL_MS 5
 
 // Left-half touch gestures for menu/control entry points.
-#define LEFT_CONTROL_HOLD_MS 2000
+#define LEFT_CONTROL_HOLD_MS 1500
 #define LEFT_CONTROL_MAX_MOVE_PX 12
 
 // Touch-position scroll control:
@@ -40,10 +40,19 @@
 // - next 1/6 => deadzone
 // - lower 4/6 => nonlinear forward speed mapping (sqrt curve in runtime)
 #define TOUCH_SCROLL_REVERSE_PX_PER_FRAME 1
-#define TOUCH_SCROLL_FORWARD_MAX_PX_PER_FRAME 1
+#define TOUCH_SCROLL_FORWARD_MAX_PX_PER_FRAME 0.3
 
 #define I2C_MASTER_SCL_IO 39
 #define I2C_MASTER_SDA_IO 40
 #define I2C_ADDR_FT3168 0x38
+
+// NVS (Non-Volatile Storage) persistence
+#define NVS_NAMESPACE "reader"
+#define NVS_KEY_VERSION "version"
+#define NVS_KEY_CHAPTER "chapter"
+#define NVS_KEY_SCROLL_Y "scroll_y"
+#define NVS_KEY_THEME "theme"
+#define NVS_KEY_FONT "font"
+#define FIRMWARE_VERSION 1
 
 #endif

@@ -39,6 +39,10 @@ void touch_runtime_init_context(touch_runtime_context_t *ctx,
     ctx->menu_open = NULL;
     ctx->menu_tap_cb = NULL;
     ctx->menu_tap_user_ctx = NULL;
+    ctx->chapter_list_open = NULL;
+    ctx->chapter_list_scroll_offset = NULL;
+    ctx->chapter_list_tap_cb = NULL;
+    ctx->chapter_list_tap_user_ctx = NULL;
 }
 
 void touch_runtime_set_menu(touch_runtime_context_t *ctx,
@@ -49,6 +53,18 @@ void touch_runtime_set_menu(touch_runtime_context_t *ctx,
     ctx->menu_open = menu_open;
     ctx->menu_tap_cb = menu_tap_cb;
     ctx->menu_tap_user_ctx = menu_tap_user_ctx;
+}
+
+void touch_runtime_set_chapter_list(touch_runtime_context_t *ctx,
+                                    volatile bool *chapter_list_open,
+                                    volatile int32_t *chapter_list_scroll_offset,
+                                    menu_tap_cb_t chapter_list_tap_cb,
+                                    void *chapter_list_tap_user_ctx)
+{
+    ctx->chapter_list_open = chapter_list_open;
+    ctx->chapter_list_scroll_offset = chapter_list_scroll_offset;
+    ctx->chapter_list_tap_cb = chapter_list_tap_cb;
+    ctx->chapter_list_tap_user_ctx = chapter_list_tap_user_ctx;
 }
 
 void touch_init(i2c_master_dev_handle_t *touch_dev)
@@ -91,6 +107,14 @@ void touch_poll_task(void *arg)
     uint16_t left_control_start_x = 0;
     uint16_t left_control_start_y = 0;
     TickType_t left_control_start_tick = 0;
+    int32_t chapter_list_last_y = 0;
+    bool chapter_list_scrolling = false;
+    bool chapter_list_dragged = false;
+
+    // Chapter-list gesture zones (must match reader_menu.c layout semantics)
+    const uint16_t chapter_list_top_buttons_end_y = 66;
+    const uint16_t chapter_list_scroll_start_y = 98;
+    const uint16_t chapter_list_select_button_end_x = 64;
 
     while (1)
     {
@@ -120,6 +144,20 @@ void touch_poll_task(void *arg)
                 left_control_tracking = false;
                 left_control_hold_fired = true;
             }
+            else if (ctx->chapter_list_open && *ctx->chapter_list_open)
+            {
+                // Chapter list is open:
+                // - top strip is for Confirm/Cancel taps
+                // - left strip is for chapter select buttons
+                // - title area (right side) is for vertical scrolling
+                left_control_tracking = false;
+                left_control_hold_fired = true;
+                chapter_list_scrolling =
+                    (next_touch_y >= chapter_list_scroll_start_y) &&
+                    (next_touch_x > chapter_list_select_button_end_x);
+                chapter_list_dragged = false;
+                chapter_list_last_y = next_touch_y;
+            }
             else
             {
                 left_control_tracking = (next_touch_x < (LCD_H_RES / 2));
@@ -128,6 +166,28 @@ void touch_poll_task(void *arg)
             left_control_start_x = next_touch_x;
             left_control_start_y = next_touch_y;
             left_control_start_tick = xTaskGetTickCount();
+        }
+
+        // Handle chapter list scrolling
+        if (next_touching && chapter_list_scrolling && ctx->chapter_list_scroll_offset)
+        {
+            int32_t delta_y = (int32_t)next_touch_y - chapter_list_last_y;
+            if (delta_y != 0)
+                chapter_list_dragged = true;
+            *ctx->chapter_list_scroll_offset -= delta_y; // Invert: dragging down scrolls up
+
+            // Clamp scroll offset to reasonable bounds
+            if (*ctx->chapter_list_scroll_offset < 0)
+                *ctx->chapter_list_scroll_offset = 0;
+            // Max scroll would be calculated based on total chapter count * row height
+            // For now, allow reasonable scrolling - max 10000 pixels
+            if (*ctx->chapter_list_scroll_offset > 10000)
+                *ctx->chapter_list_scroll_offset = 10000;
+
+            chapter_list_last_y = next_touch_y;
+
+            if (ctx->render_task_handle)
+                xTaskNotifyGive(*ctx->render_task_handle);
         }
 
         if (next_touching && left_control_tracking)
@@ -162,7 +222,21 @@ void touch_poll_task(void *arg)
 
         if (!next_touching && last_touching)
         {
-            if (ctx->menu_open && *ctx->menu_open)
+            chapter_list_scrolling = false;
+            if (ctx->chapter_list_open && *ctx->chapter_list_open)
+            {
+                bool is_top_button_tap = (last_touch_sample < chapter_list_top_buttons_end_y);
+                bool is_select_button_tap =
+                    (last_touch_sample >= chapter_list_scroll_start_y) &&
+                    (last_touch_x_sample <= chapter_list_select_button_end_x);
+
+                // Dispatch chapter-list taps only for top buttons or row select-buttons.
+                if ((is_top_button_tap || is_select_button_tap) && !chapter_list_dragged && ctx->chapter_list_tap_cb)
+                {
+                    ctx->chapter_list_tap_cb(last_touch_x_sample, last_touch_sample, ctx->chapter_list_tap_user_ctx);
+                }
+            }
+            else if (ctx->menu_open && *ctx->menu_open)
             {
                 if (menu_opened_by_hold)
                 {

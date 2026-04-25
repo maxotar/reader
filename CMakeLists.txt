@@ -25,6 +25,7 @@ set(COMPONENTS
     esp_system
     spi_flash
     spiffs
+    nvs_flash
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

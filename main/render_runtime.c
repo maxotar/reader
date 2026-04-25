@@ -15,9 +15,13 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile bool *spi_bus_busy,
                                  volatile bool *is_rendering_baked,
                                  volatile bool *menu_open,
+                                 volatile bool *chapter_list_open,
+                                 volatile int32_t *chapter_list_scroll_offset,
                                  volatile bool *needs_layout_rebuild,
                                  void (*layout_rebuild_fn)(void *user_ctx),
                                  void *layout_rebuild_user_ctx,
+                                 void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out),
+                                 void *menu_state_user_ctx,
                                  TaskHandle_t *render_task_handle,
                                  uint32_t *frame_count,
                                  lv_color_t **scratch_buffer,
@@ -32,9 +36,13 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
     ctx->spi_bus_busy = spi_bus_busy;
     ctx->is_rendering_baked = is_rendering_baked;
     ctx->menu_open = menu_open;
+    ctx->chapter_list_open = chapter_list_open;
+    ctx->chapter_list_scroll_offset = chapter_list_scroll_offset;
     ctx->needs_layout_rebuild = needs_layout_rebuild;
     ctx->layout_rebuild_fn = layout_rebuild_fn;
     ctx->layout_rebuild_user_ctx = layout_rebuild_user_ctx;
+    ctx->menu_state_fn = menu_state_fn;
+    ctx->menu_state_user_ctx = menu_state_user_ctx;
     ctx->render_task_handle = render_task_handle;
     ctx->frame_count = frame_count;
     ctx->scratch_buffer = scratch_buffer;
@@ -152,7 +160,11 @@ void render_task(void *arg)
         {
             if (!menu_rendered && *ctx->scratch_buffer && !*ctx->spi_bus_busy)
             {
-                reader_menu_render(*ctx->scratch_buffer);
+                reader_menu_state_t menu_state = {0};
+                if (ctx->menu_state_fn)
+                    ctx->menu_state_fn(ctx->menu_state_user_ctx, &menu_state);
+
+                reader_menu_render(*ctx->scratch_buffer, &menu_state);
                 *ctx->spi_bus_busy = true;
                 esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, *ctx->scratch_buffer);
                 last_blit_scroll_y = -1; // force content redraw when menu closes
@@ -161,6 +173,39 @@ void render_task(void *arg)
             goto render_wait;
         }
         menu_rendered = false; // reset so menu re-renders next time it opens
+
+        // --- Chapter list overlay: redraw when list state changes; skip normal tile path while open ---
+        bool chapter_list_currently_open = (ctx->chapter_list_open && *ctx->chapter_list_open);
+        static bool chapter_list_rendered = false;
+        static int32_t chapter_list_last_scroll_offset = -1;
+        static uint16_t chapter_list_last_selected = UINT16_MAX;
+        if (chapter_list_currently_open)
+        {
+            int32_t scroll_offset = (ctx->chapter_list_scroll_offset) ? *ctx->chapter_list_scroll_offset : 0;
+            reader_menu_state_t menu_state = {0};
+            if (ctx->menu_state_fn)
+                ctx->menu_state_fn(ctx->menu_state_user_ctx, &menu_state);
+
+            bool chapter_list_needs_redraw =
+                !chapter_list_rendered ||
+                (scroll_offset != chapter_list_last_scroll_offset) ||
+                (menu_state.current_chapter != chapter_list_last_selected);
+
+            if (chapter_list_needs_redraw && *ctx->scratch_buffer && !*ctx->spi_bus_busy)
+            {
+                reader_menu_render_chapter_list(*ctx->scratch_buffer, &menu_state, scroll_offset);
+                *ctx->spi_bus_busy = true;
+                esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, *ctx->scratch_buffer);
+                last_blit_scroll_y = -1; // force content redraw when list closes
+                chapter_list_rendered = true;
+                chapter_list_last_scroll_offset = scroll_offset;
+                chapter_list_last_selected = menu_state.current_chapter;
+            }
+            goto render_wait;
+        }
+        chapter_list_rendered = false; // reset so chapter list re-renders next time it opens
+        chapter_list_last_scroll_offset = -1;
+        chapter_list_last_selected = UINT16_MAX;
 
         int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (*ctx->scroll_y - last_blit_scroll_y);
         int32_t delta_scroll = scroll_step;

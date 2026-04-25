@@ -143,7 +143,7 @@ def is_probable_chapter(item: SpineItem) -> bool:
     return bool(CHAPTER_HINT_RE.search(basename))
 
 
-def select_first_content_item(book: EpubBook) -> SpineItem:
+def select_content_items(book: EpubBook) -> list[SpineItem]:
     chapter_candidates: list[SpineItem] = []
     fallback_candidates: list[SpineItem] = []
 
@@ -161,9 +161,9 @@ def select_first_content_item(book: EpubBook) -> SpineItem:
                 fallback_candidates.append(item)
 
     if chapter_candidates:
-        return chapter_candidates[0]
+        return chapter_candidates
     if fallback_candidates:
-        return fallback_candidates[0]
+        return fallback_candidates
     raise ValueError("EPUB spine does not contain an XHTML/HTML document")
 
 
@@ -250,25 +250,112 @@ def extract_document_text(zf: zipfile.ZipFile, book: EpubBook, item: SpineItem) 
     return normalize_text_blocks(blocks)
 
 
-def build_reader_header(title: str, chapter_text: str, source_name: str) -> str:
-    escaped_title = to_c_string_literal(title)
-    escaped_text = to_c_string_literal(chapter_text)
-    return (
-        "#ifndef CONTENT_GENERATED_H\n"
-        "#define CONTENT_GENERATED_H\n\n"
-        f"// Auto-generated from {source_name}. Do not edit manually.\n"
-        "static const char chapter_title[] =\n"
-        f"{escaped_title};\n\n"
-        "static const char chapter_content[] =\n"
-        f"{escaped_text};\n\n"
-        "#endif\n"
-    )
+def derive_chapter_title(item: SpineItem, chapter_text: str, chapter_number: int) -> str:
+    lines = [line.strip() for line in chapter_text.split("\n\n") if line.strip()]
+    first_line = lines[0] if lines else ""
+
+    roman_re = re.compile(r"^[IVXLCDM]+$", re.IGNORECASE)
+    if first_line and len(first_line) <= 12 and roman_re.match(first_line) and len(lines) >= 2:
+        second_line = lines[1]
+        if second_line and len(second_line) <= 100:
+            return f"{first_line} - {second_line}"
+
+    if first_line and len(first_line) <= 100:
+        return first_line
+
+    stem = posixpath.splitext(posixpath.basename(item.href))[0]
+    stem_clean = re.sub(r"[_\-]+", " ", stem).strip()
+    if stem_clean:
+        stem_clean = re.sub(r"\s+", " ", stem_clean)
+        return stem_clean.title()
+
+    return f"Chapter {chapter_number}"
+
+
+def strip_title_from_content(chapter_text: str, chapter_title: str) -> str:
+    """Remove the chapter title from the beginning of the content text.
+    
+    If the content starts with the title lines (which are used to derive chapter_title),
+    remove them to avoid displaying the title twice in the renderer.
+    """
+    lines = [line.strip() for line in chapter_text.split("\n\n") if line.strip()]
+    if not lines:
+        return chapter_text
+
+    # Check if the title is a "Roman - Subtitle" pattern
+    roman_re = re.compile(r"^[IVXLCDM]+$", re.IGNORECASE)
+    if (len(lines) >= 2 and 
+        roman_re.match(lines[0]) and 
+        chapter_title.startswith(lines[0] + " - ") and
+        chapter_title.endswith(lines[1])):
+        # Remove first two paragraphs (roman numeral and subtitle)
+        remaining_text = "\n\n".join(lines[2:])
+        return remaining_text if remaining_text.strip() else chapter_text
+    
+    # Check if the title matches the first line
+    if lines and lines[0] == chapter_title:
+        # Remove first paragraph
+        remaining_text = "\n\n".join(lines[1:])
+        return remaining_text if remaining_text.strip() else chapter_text
+    
+    return chapter_text
+
+
+def build_reader_header(title: str,
+                        chapter_titles: list[str],
+                        chapter_texts: list[str],
+                        source_name: str) -> str:
+    escaped_book_title = to_c_string_literal(title)
+
+    chapter_entries: list[str] = []
+    chapter_title_decl: list[str] = []
+    chapter_text_decl: list[str] = []
+
+    for i, (chapter_title, chapter_text) in enumerate(zip(chapter_titles, chapter_texts)):
+        chapter_title_decl.append(
+            f"static const char generated_chapter_title_{i:03d}[] =\n"
+            f"{to_c_string_literal(chapter_title)};\n"
+        )
+        chapter_text_decl.append(
+            f"static const char generated_chapter_content_{i:03d}[] =\n"
+            f"{to_c_string_literal(chapter_text)};\n"
+        )
+        chapter_entries.append(
+            f"    generated_chapter_title_{i:03d}"
+        )
+
+    chapter_content_entries: list[str] = []
+    for i in range(len(chapter_texts)):
+        chapter_content_entries.append(f"    generated_chapter_content_{i:03d}")
+
+    parts: list[str] = [
+        "#ifndef CONTENT_GENERATED_H\n",
+        "#define CONTENT_GENERATED_H\n\n",
+        "#include <stdint.h>\n\n",
+        "#define CONTENT_GENERATED_HAS_CHAPTERS 1\n\n",
+        f"// Auto-generated from {source_name}. Do not edit manually.\n",
+        "static const char book_title[] =\n",
+        f"{escaped_book_title};\n\n",
+        f"static const uint16_t generated_chapter_count = {len(chapter_texts)};\n\n",
+        "\n".join(chapter_title_decl),
+        "\n",
+        "\n".join(chapter_text_decl),
+        "\n",
+        "static const char *const generated_chapter_titles[] = {\n",
+        ",\n".join(chapter_entries),
+        "\n};\n\n",
+        "static const char *const generated_chapter_contents[] = {\n",
+        ",\n".join(chapter_content_entries),
+        "\n};\n\n",
+        "#endif\n",
+    ]
+    return "".join(parts)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Inspect an EPUB and extract the first spine chapter")
+    parser = argparse.ArgumentParser(description="Inspect an EPUB and extract all content chapters")
     parser.add_argument("epub", type=Path, help="Path to the EPUB file")
-    parser.add_argument("--text-out", type=Path, default=Path("generated/first_chapter.txt"))
+    parser.add_argument("--text-out", type=Path, default=Path("generated/book_preview.txt"))
     parser.add_argument("--header-out", type=Path, default=Path("main/content_generated.h"))
     parser.add_argument(
         "--ascii-punctuation",
@@ -286,15 +373,37 @@ def main() -> int:
 
     with zipfile.ZipFile(epub_path) as zf:
         book = parse_book(zf, epub_path)
-        first_item = select_first_content_item(book)
-        first_text = extract_document_text(zf, book, first_item)
-        first_text = normalize_for_lvgl_font(first_text, args.ascii_punctuation)
+        selected_items = select_content_items(book)
+
+        chapter_titles: list[str] = []
+        chapter_texts: list[str] = []
+        chapter_hrefs: list[str] = []
+
+        for i, item in enumerate(selected_items, start=1):
+            chapter_text = extract_document_text(zf, book, item)
+            chapter_text = normalize_for_lvgl_font(chapter_text, args.ascii_punctuation)
+            if not chapter_text:
+                continue
+
+            chapter_title = derive_chapter_title(item, chapter_text, i)
+            chapter_text = strip_title_from_content(chapter_text, chapter_title)
+            chapter_titles.append(chapter_title)
+            chapter_texts.append(chapter_text)
+            chapter_hrefs.append(item.href)
+
+        if not chapter_texts:
+            raise ValueError("No chapter content extracted from EPUB")
 
     args.text_out.parent.mkdir(parents=True, exist_ok=True)
     args.header_out.parent.mkdir(parents=True, exist_ok=True)
-    args.text_out.write_text(first_text, encoding="utf-8")
+    preview_lines: list[str] = []
+    for i, (chapter_title, chapter_text) in enumerate(zip(chapter_titles, chapter_texts), start=1):
+        preview_lines.append(f"[{i}] {chapter_title}")
+        preview_lines.append(chapter_text)
+        preview_lines.append("")
+    args.text_out.write_text("\n\n".join(preview_lines), encoding="utf-8")
     args.header_out.write_text(
-        build_reader_header(book.title, first_text, epub_path.name),
+        build_reader_header(book.title, chapter_titles, chapter_texts, epub_path.name),
         encoding="utf-8",
     )
 
@@ -302,13 +411,13 @@ def main() -> int:
         "epub": str(epub_path),
         "title": book.title,
         "opf_path": book.opf_path,
-        "first_spine_item": first_item.item_id,
-        "first_spine_href": first_item.href,
+        "chapter_count": len(chapter_texts),
+        "chapter_hrefs": chapter_hrefs,
         "text_output": str(args.text_out),
         "header_output": str(args.header_out),
         "ascii_punctuation": args.ascii_punctuation,
-        "character_count": len(first_text),
-        "paragraph_count": len([part for part in first_text.split("\n\n") if part.strip()]),
+        "character_count": sum(len(text) for text in chapter_texts),
+        "paragraph_count": sum(len([part for part in text.split("\n\n") if part.strip()]) for text in chapter_texts),
     }
     print(json.dumps(summary, indent=2))
     return 0

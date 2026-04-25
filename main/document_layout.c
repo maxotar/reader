@@ -6,6 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TITLE_BODY_GAP 12
+
+static int32_t compute_body_start_y(const document_layout_t *layout)
+{
+    int32_t start_y = TITLE_Y + (int32_t)layout->title_height + TITLE_BODY_GAP;
+    if (start_y < BODY_Y)
+        start_y = BODY_Y;
+    return start_y;
+}
+
 static char *copy_paragraph_text_range(const char *text, uint32_t start_offset, uint32_t end_offset)
 {
     size_t len = end_offset - start_offset;
@@ -50,13 +60,13 @@ static int32_t compute_body_height(const document_layout_t *layout)
         return 0;
 
     const paragraph_span_t *last_paragraph = &layout->paragraphs[layout->paragraph_count - 1];
-    return (last_paragraph->y_offset + last_paragraph->height) - BODY_Y;
+    return (last_paragraph->y_offset + last_paragraph->height) - compute_body_start_y(layout);
 }
 
 static void compute_paragraph_layout(document_layout_t *layout, const char *text)
 {
     (void)text;
-    int32_t paragraph_y = BODY_Y;
+    int32_t paragraph_y = compute_body_start_y(layout);
 
     for (uint32_t index = 0; index < layout->paragraph_count; index++)
     {
@@ -86,9 +96,10 @@ static void compute_paragraph_layout(document_layout_t *layout, const char *text
 
 static int32_t compute_document_height(const document_layout_t *layout)
 {
+    int32_t body_start_y = compute_body_start_y(layout);
     int32_t body_height = compute_body_height(layout);
     int32_t title_bottom = TITLE_Y + layout->title_height;
-    int32_t body_bottom = BODY_Y + body_height + CONTENT_BOTTOM_PADDING;
+    int32_t body_bottom = body_start_y + body_height + CONTENT_BOTTOM_PADDING;
     int32_t total_height = (body_bottom > title_bottom) ? body_bottom : title_bottom;
 
     return (total_height > LCD_V_RES) ? total_height : LCD_V_RES;
