@@ -86,6 +86,7 @@
 
 // --- Shared State ---
 static volatile int32_t scroll_y = 0;
+static volatile uint16_t touch_x = 0;
 static volatile uint16_t touch_y = 0;
 static volatile bool is_touching = false;
 static volatile bool spi_bus_busy = false;
@@ -109,6 +110,25 @@ static touch_runtime_context_t touch_ctx = {0};
 static uint32_t frame_count = 0;
 static uint32_t last_frame_count = 0;
 static stats_context_t stats_ctx = {0};
+
+static void handle_left_control_event(left_control_event_t event,
+                                      uint16_t x,
+                                      uint16_t y,
+                                      void *user_ctx)
+{
+    (void)user_ctx;
+    switch (event)
+    {
+    case LEFT_CONTROL_EVENT_TAP:
+        printf("Left control tap at (%u,%u)\n", (unsigned)x, (unsigned)y);
+        break;
+    case LEFT_CONTROL_EVENT_HOLD:
+        printf("Left control hold at (%u,%u)\n", (unsigned)x, (unsigned)y);
+        break;
+    default:
+        break;
+    }
+}
 
 static uint32_t count_loaded_tiles(void)
 {
@@ -200,6 +220,7 @@ void app_main(void)
 
     render_runtime_init_context(&render_ctx,
                                 &scroll_y,
+                                &touch_x,
                                 &touch_y,
                                 &is_touching,
                                 &spi_bus_busy,
@@ -214,8 +235,11 @@ void app_main(void)
     touch_runtime_init_context(&touch_ctx,
                                touch_dev,
                                &is_touching,
+                               &touch_x,
                                &touch_y,
-                               &render_task_handle);
+                               &render_task_handle,
+                               handle_left_control_event,
+                               NULL);
 
     stats_ctx.frame_count = &frame_count;
     stats_ctx.last_frame_count = &last_frame_count;

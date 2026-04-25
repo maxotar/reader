@@ -7,6 +7,7 @@
 
 void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile int32_t *scroll_y,
+                                 volatile uint16_t *touch_x,
                                  volatile uint16_t *touch_y,
                                  volatile bool *is_touching,
                                  volatile bool *spi_bus_busy,
@@ -19,6 +20,7 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  tile_cache_context_t *tile_cache)
 {
     ctx->scroll_y = scroll_y;
+    ctx->touch_x = touch_x;
     ctx->touch_y = touch_y;
     ctx->is_touching = is_touching;
     ctx->spi_bus_busy = spi_bus_busy;
@@ -42,10 +44,43 @@ IRAM_ATTR bool render_flush_ready_cb(esp_lcd_panel_io_handle_t io,
     return false;
 }
 
+static float touch_position_scroll_velocity(uint16_t touch_y)
+{
+    int32_t y = (int32_t)touch_y;
+    if (y > (LCD_V_RES - 1))
+        y = LCD_V_RES - 1;
+
+    int32_t reverse_zone_end = LCD_V_RES / 6;
+    int32_t deadzone_end = (LCD_V_RES * 2) / 6;
+
+    if (y < reverse_zone_end)
+        return -(float)TOUCH_SCROLL_REVERSE_PX_PER_FRAME;
+    if (y < deadzone_end)
+        return 0.0f;
+
+    float denom = (float)((LCD_V_RES - 1) - deadzone_end);
+    if (denom <= 0.0f)
+        return 0.0f;
+
+    float normalized = (float)(y - deadzone_end) / denom;
+    if (normalized < 0.0f)
+        normalized = 0.0f;
+    if (normalized > 1.0f)
+        normalized = 1.0f;
+
+    // Quadratic ramp: very fine low-end control, then faster acceleration near bottom.
+    float curved = normalized * normalized;
+    float max_speed = (float)TOUCH_SCROLL_FORWARD_MAX_PX_PER_FRAME;
+    if (max_speed < 1.0f)
+        max_speed = 1.0f;
+
+    return curved * max_speed;
+}
+
 void render_task(void *arg)
 {
     render_runtime_context_t *ctx = (render_runtime_context_t *)arg;
-    if (!ctx || !ctx->scroll_y || !ctx->touch_y || !ctx->is_touching || !ctx->spi_bus_busy ||
+    if (!ctx || !ctx->scroll_y || !ctx->touch_x || !ctx->touch_y || !ctx->is_touching || !ctx->spi_bus_busy ||
         !ctx->is_rendering_baked || !ctx->render_task_handle || !ctx->frame_count ||
         !ctx->scratch_buffer || !ctx->layout || !ctx->tile_cache)
     {
@@ -53,8 +88,8 @@ void render_task(void *arg)
     }
 
     *ctx->render_task_handle = xTaskGetCurrentTaskHandle();
-    uint16_t last_touch_y = 0;
     int32_t last_blit_scroll_y = -1;
+    float scroll_accumulator = 0.0f;
 
     while (1)
     {
@@ -62,21 +97,33 @@ void render_task(void *arg)
         if (max_scroll_y < 0)
             max_scroll_y = 0;
 
-        if (*ctx->is_touching)
+        bool scroll_touch_active = *ctx->is_touching && (*ctx->touch_x >= (LCD_H_RES / 2));
+
+        if (scroll_touch_active)
         {
-            if (last_touch_y != 0)
+            float velocity = touch_position_scroll_velocity(*ctx->touch_y);
+            scroll_accumulator += velocity;
+
+            int32_t position_step = (int32_t)scroll_accumulator;
+            if (position_step != 0)
             {
-                *ctx->scroll_y -= (*ctx->touch_y - last_touch_y);
+                scroll_accumulator -= (float)position_step;
+                *ctx->scroll_y += position_step;
                 if (*ctx->scroll_y < 0)
+                {
                     *ctx->scroll_y = 0;
+                    scroll_accumulator = 0.0f;
+                }
                 if (*ctx->scroll_y > max_scroll_y)
+                {
                     *ctx->scroll_y = max_scroll_y;
+                    scroll_accumulator = 0.0f;
+                }
             }
-            last_touch_y = *ctx->touch_y;
         }
         else
         {
-            last_touch_y = 0;
+            scroll_accumulator = 0.0f;
         }
 
         int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (*ctx->scroll_y - last_blit_scroll_y);

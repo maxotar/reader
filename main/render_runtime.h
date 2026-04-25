@@ -15,6 +15,7 @@
 typedef struct
 {
     volatile int32_t *scroll_y;
+    volatile uint16_t *touch_x;
     volatile uint16_t *touch_y;
     volatile bool *is_touching;
     volatile bool *spi_bus_busy;
@@ -29,6 +30,7 @@ typedef struct
 
 void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile int32_t *scroll_y,
+                                 volatile uint16_t *touch_x,
                                  volatile uint16_t *touch_y,
                                  volatile bool *is_touching,
                                  volatile bool *spi_bus_busy,
