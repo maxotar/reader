@@ -4,6 +4,8 @@
 #include <stdlib.h>
 
 #include "reader_config.h"
+#include "reader_theme.h"
+#include "reader_menu.h"
 
 void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile int32_t *scroll_y,
@@ -12,6 +14,10 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile bool *is_touching,
                                  volatile bool *spi_bus_busy,
                                  volatile bool *is_rendering_baked,
+                                 volatile bool *menu_open,
+                                 volatile bool *needs_layout_rebuild,
+                                 void (*layout_rebuild_fn)(void *user_ctx),
+                                 void *layout_rebuild_user_ctx,
                                  TaskHandle_t *render_task_handle,
                                  uint32_t *frame_count,
                                  lv_color_t **scratch_buffer,
@@ -25,6 +31,10 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
     ctx->is_touching = is_touching;
     ctx->spi_bus_busy = spi_bus_busy;
     ctx->is_rendering_baked = is_rendering_baked;
+    ctx->menu_open = menu_open;
+    ctx->needs_layout_rebuild = needs_layout_rebuild;
+    ctx->layout_rebuild_fn = layout_rebuild_fn;
+    ctx->layout_rebuild_user_ctx = layout_rebuild_user_ctx;
     ctx->render_task_handle = render_task_handle;
     ctx->frame_count = frame_count;
     ctx->scratch_buffer = scratch_buffer;
@@ -90,6 +100,7 @@ void render_task(void *arg)
     *ctx->render_task_handle = xTaskGetCurrentTaskHandle();
     int32_t last_blit_scroll_y = -1;
     float scroll_accumulator = 0.0f;
+    bool menu_rendered = false;
 
     while (1)
     {
@@ -125,6 +136,31 @@ void render_task(void *arg)
         {
             scroll_accumulator = 0.0f;
         }
+
+        // --- Layout rebuild (triggered by font size change; runs in render task for safe access) ---
+        if (ctx->needs_layout_rebuild && *ctx->needs_layout_rebuild)
+        {
+            *ctx->needs_layout_rebuild = false;
+            if (ctx->layout_rebuild_fn)
+                ctx->layout_rebuild_fn(ctx->layout_rebuild_user_ctx);
+            last_blit_scroll_y = -1;
+        }
+
+        // --- Menu overlay: render once per open; skip normal tile path while open ---
+        bool menu_currently_open = (ctx->menu_open && *ctx->menu_open);
+        if (menu_currently_open)
+        {
+            if (!menu_rendered && *ctx->scratch_buffer && !*ctx->spi_bus_busy)
+            {
+                reader_menu_render(*ctx->scratch_buffer);
+                *ctx->spi_bus_busy = true;
+                esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, *ctx->scratch_buffer);
+                last_blit_scroll_y = -1; // force content redraw when menu closes
+                menu_rendered = true;
+            }
+            goto render_wait;
+        }
+        menu_rendered = false; // reset so menu re-renders next time it opens
 
         int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (*ctx->scroll_y - last_blit_scroll_y);
         int32_t delta_scroll = scroll_step;
@@ -169,9 +205,8 @@ void render_task(void *arg)
                     }
                     else
                     {
-                        memset(&(*ctx->scratch_buffer)[rows_from_current * LCD_H_RES],
-                               0,
-                               (size_t)rows_from_next * LCD_H_RES * sizeof(lv_color_t));
+                        reader_theme_fill_buffer(&(*ctx->scratch_buffer)[rows_from_current * LCD_H_RES],
+                                                 (size_t)rows_from_next * (size_t)LCD_H_RES);
                     }
                     esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, *ctx->scratch_buffer);
                 }

@@ -24,6 +24,7 @@ void tile_cache_init_context(tile_cache_context_t *ctx,
                              const char *title,
                              const char *content);
 uint32_t tile_cache_count_loaded(const tile_cache_context_t *ctx);
+void tile_cache_invalidate_all(tile_cache_context_t *ctx);
 bool tile_cache_ensure_resident(tile_cache_context_t *ctx, int32_t tile_idx);
 void tile_cache_prefetch_neighbors(tile_cache_context_t *ctx, int32_t center_tile_idx, int32_t direction);
 

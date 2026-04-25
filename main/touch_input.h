@@ -21,6 +21,8 @@ typedef void (*left_control_event_cb_t)(left_control_event_t event,
                                         uint16_t y,
                                         void *user_ctx);
 
+typedef void (*menu_tap_cb_t)(uint16_t x, uint16_t y, void *user_ctx);
+
 typedef struct
 {
     i2c_master_dev_handle_t touch_dev;
@@ -30,6 +32,9 @@ typedef struct
     TaskHandle_t *render_task_handle;
     left_control_event_cb_t left_control_cb;
     void *left_control_user_ctx;
+    volatile bool *menu_open;
+    menu_tap_cb_t menu_tap_cb;
+    void *menu_tap_user_ctx;
 } touch_runtime_context_t;
 
 void touch_runtime_init_context(touch_runtime_context_t *ctx,
@@ -40,6 +45,11 @@ void touch_runtime_init_context(touch_runtime_context_t *ctx,
                                 TaskHandle_t *render_task_handle,
                                 left_control_event_cb_t left_control_cb,
                                 void *left_control_user_ctx);
+
+void touch_runtime_set_menu(touch_runtime_context_t *ctx,
+                            volatile bool *menu_open,
+                            menu_tap_cb_t menu_tap_cb,
+                            void *menu_tap_user_ctx);
 
 void touch_poll_task(void *arg);
 

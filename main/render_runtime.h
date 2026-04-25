@@ -20,6 +20,10 @@ typedef struct
     volatile bool *is_touching;
     volatile bool *spi_bus_busy;
     volatile bool *is_rendering_baked;
+    volatile bool *menu_open;
+    volatile bool *needs_layout_rebuild;
+    void (*layout_rebuild_fn)(void *user_ctx);
+    void *layout_rebuild_user_ctx;
     TaskHandle_t *render_task_handle;
     uint32_t *frame_count;
     lv_color_t **scratch_buffer;
@@ -35,6 +39,10 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  volatile bool *is_touching,
                                  volatile bool *spi_bus_busy,
                                  volatile bool *is_rendering_baked,
+                                 volatile bool *menu_open,
+                                 volatile bool *needs_layout_rebuild,
+                                 void (*layout_rebuild_fn)(void *user_ctx),
+                                 void *layout_rebuild_user_ctx,
                                  TaskHandle_t *render_task_handle,
                                  uint32_t *frame_count,
                                  lv_color_t **scratch_buffer,

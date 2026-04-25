@@ -18,13 +18,13 @@
 #define TILE_HEIGHT 1024
 #define RUNTIME_TILE_BUFFERS 3
 
-#define CONTENT_X_PADDING 0
+#define CONTENT_X_PADDING 6
 #define CONTENT_WIDTH (LCD_H_RES - (CONTENT_X_PADDING * 2))
-#define TITLE_Y 0
-#define BODY_Y 48
+#define TITLE_Y 8
+#define BODY_Y 58
 #define BODY_LINE_SPACE 4
 #define BODY_PARAGRAPH_GAP 18
-#define CONTENT_BOTTOM_PADDING 0
+#define CONTENT_BOTTOM_PADDING 10
 
 #define SCROLL_ACTIVE_FRAME_MS 1
 #define SCROLL_IDLE_SLEEP_MS 8
@@ -32,7 +32,7 @@
 #define TOUCH_POLL_MS 5
 
 // Left-half touch gestures for menu/control entry points.
-#define LEFT_CONTROL_HOLD_MS 450
+#define LEFT_CONTROL_HOLD_MS 2000
 #define LEFT_CONTROL_MAX_MOVE_PX 12
 
 // Touch-position scroll control:

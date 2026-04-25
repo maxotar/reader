@@ -6,6 +6,7 @@
 #include "lvgl.h"
 #include "reader_config.h"
 #include "reader_font.h"
+#include "reader_theme.h"
 
 void tile_cache_init_context(tile_cache_context_t *ctx,
                              document_layout_t *layout,
@@ -32,6 +33,20 @@ uint32_t tile_cache_count_loaded(const tile_cache_context_t *ctx)
             loaded++;
     }
     return loaded;
+}
+
+void tile_cache_invalidate_all(tile_cache_context_t *ctx)
+{
+    if (!ctx || !ctx->layout || !ctx->layout->tiles)
+        return;
+
+    for (uint32_t index = 0; index < ctx->layout->tile_count; index++)
+    {
+        render_tile_t *tile = &ctx->layout->tiles[index];
+        tile->buffer = NULL;
+        tile->valid = false;
+        tile->generation = 0;
+    }
 }
 
 static lv_color_t *acquire_tile_buffer(tile_cache_context_t *ctx)
@@ -84,8 +99,8 @@ static bool bake_tile_bitmap(tile_cache_context_t *ctx, render_tile_t *tile)
     if (!tile || !tile->buffer || tile->pixel_height == 0)
         return false;
 
-    size_t tile_size = (size_t)LCD_H_RES * (size_t)tile->pixel_height * sizeof(lv_color_t);
-    memset(tile->buffer, 0, tile_size);
+    size_t tile_pixels = (size_t)LCD_H_RES * (size_t)tile->pixel_height;
+    reader_theme_fill_buffer(tile->buffer, tile_pixels);
 
     lv_obj_t *canvas = lv_canvas_create(lv_scr_act());
     if (!canvas)
@@ -94,7 +109,7 @@ static bool bake_tile_bitmap(tile_cache_context_t *ctx, render_tile_t *tile)
 
     lv_draw_label_dsc_t title_dsc;
     lv_draw_label_dsc_init(&title_dsc);
-    title_dsc.color = lv_color_hex(0xFF2200);
+    title_dsc.color = reader_theme_title_color();
     title_dsc.font = reader_font_title();
 
     int32_t title_bottom = TITLE_Y + ctx->layout->title_height;
@@ -110,7 +125,7 @@ static bool bake_tile_bitmap(tile_cache_context_t *ctx, render_tile_t *tile)
 
     lv_draw_label_dsc_t body_dsc;
     lv_draw_label_dsc_init(&body_dsc);
-    body_dsc.color = lv_color_hex(0xCC1100);
+    body_dsc.color = reader_theme_body_color();
     body_dsc.font = reader_font_body();
     body_dsc.line_space = BODY_LINE_SPACE;
 

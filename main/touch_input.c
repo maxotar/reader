@@ -36,6 +36,19 @@ void touch_runtime_init_context(touch_runtime_context_t *ctx,
     ctx->render_task_handle = render_task_handle;
     ctx->left_control_cb = left_control_cb;
     ctx->left_control_user_ctx = left_control_user_ctx;
+    ctx->menu_open = NULL;
+    ctx->menu_tap_cb = NULL;
+    ctx->menu_tap_user_ctx = NULL;
+}
+
+void touch_runtime_set_menu(touch_runtime_context_t *ctx,
+                            volatile bool *menu_open,
+                            menu_tap_cb_t menu_tap_cb,
+                            void *menu_tap_user_ctx)
+{
+    ctx->menu_open = menu_open;
+    ctx->menu_tap_cb = menu_tap_cb;
+    ctx->menu_tap_user_ctx = menu_tap_user_ctx;
 }
 
 void touch_init(i2c_master_dev_handle_t *touch_dev)
@@ -74,6 +87,7 @@ void touch_poll_task(void *arg)
 
     bool left_control_tracking = false;
     bool left_control_hold_fired = false;
+    bool menu_opened_by_hold = false;
     uint16_t left_control_start_x = 0;
     uint16_t left_control_start_y = 0;
     TickType_t left_control_start_tick = 0;
@@ -99,8 +113,18 @@ void touch_poll_task(void *arg)
 
         if (next_touching && !last_touching)
         {
-            left_control_tracking = (next_touch_x < (LCD_H_RES / 2));
-            left_control_hold_fired = false;
+            menu_opened_by_hold = false;
+            if (ctx->menu_open && *ctx->menu_open)
+            {
+                // Menu is open: suppress hold detection, just track touch for selection.
+                left_control_tracking = false;
+                left_control_hold_fired = true;
+            }
+            else
+            {
+                left_control_tracking = (next_touch_x < (LCD_H_RES / 2));
+                left_control_hold_fired = false;
+            }
             left_control_start_x = next_touch_x;
             left_control_start_y = next_touch_y;
             left_control_start_tick = xTaskGetTickCount();
@@ -130,6 +154,7 @@ void touch_poll_task(void *arg)
                                                     next_touch_x,
                                                     next_touch_y);
                         left_control_hold_fired = true;
+                        menu_opened_by_hold = true;
                     }
                 }
             }
@@ -137,7 +162,19 @@ void touch_poll_task(void *arg)
 
         if (!next_touching && last_touching)
         {
-            if (left_control_tracking && !left_control_hold_fired)
+            if (ctx->menu_open && *ctx->menu_open)
+            {
+                if (menu_opened_by_hold)
+                {
+                    // Swallow the lift that ends the hold gesture — menu just opened.
+                    menu_opened_by_hold = false;
+                }
+                else if (ctx->menu_tap_cb)
+                {
+                    ctx->menu_tap_cb(last_touch_x_sample, last_touch_sample, ctx->menu_tap_user_ctx);
+                }
+            }
+            else if (left_control_tracking && !left_control_hold_fired)
             {
                 dispatch_left_control_event(ctx,
                                             LEFT_CONTROL_EVENT_TAP,

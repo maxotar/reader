@@ -7,7 +7,9 @@
     The goal is to render text-centric content (EPUB chapters, documents, and
     long-form reading material) with a visually minimal aesthetic:
         - Pure black background (pixel-off AMOLED state)
-        - High-contrast red typography for reduced eye strain and clarity
+            - Text typography adapted per active theme
+            - Theme system (dark/light) with sepia light palette
+            - Settings menu (long-press left side): theme toggle and font size selection
         - Scrollable continuous reading surface
         - Touch-driven, low-latency redraw during interaction and scrolling
 
@@ -72,6 +74,9 @@
 #include "display_hal.h"
 #include "tile_cache.h"
 #include "render_runtime.h"
+#include "reader_theme.h"
+#include "reader_font.h"
+#include "reader_menu.h"
 #if defined(__has_include)
 #if __has_include("content_generated.h")
 #include "content_generated.h"
@@ -91,6 +96,8 @@ static volatile uint16_t touch_y = 0;
 static volatile bool is_touching = false;
 static volatile bool spi_bus_busy = false;
 static volatile bool is_rendering_baked = false;
+static volatile bool menu_open = false;
+static volatile bool needs_layout_rebuild = false;
 
 // tile_cache_buffers: the three real PSRAM-resident tile bitmaps used at runtime.
 // scratch_buffer: single-screen composition buffer for two-tile boundary crossings.
@@ -111,6 +118,71 @@ static uint32_t frame_count = 0;
 static uint32_t last_frame_count = 0;
 static stats_context_t stats_ctx = {0};
 
+static void do_layout_rebuild(void *user_ctx)
+{
+    (void)user_ctx;
+    scroll_y = 0;
+    reset_document_layout(&doc_layout);
+    init_document_layout(&doc_layout, chapter_title, chapter_content);
+    tile_cache_invalidate_all(&tile_cache_ctx);
+    printf("Layout rebuilt: %lu paragraphs, %ld px total\n",
+           (unsigned long)doc_layout.paragraph_count,
+           (long)doc_layout.total_height);
+}
+
+static void handle_menu_tap(uint16_t x, uint16_t y, void *user_ctx)
+{
+    (void)user_ctx;
+    reader_menu_action_t action = reader_menu_hit_test(x, y);
+    menu_open = false;
+
+    switch (action)
+    {
+    case READER_MENU_ACTION_SET_THEME_DARK:
+        if (reader_theme_get_mode() != READER_THEME_DARK)
+        {
+            reader_theme_toggle();
+            tile_cache_invalidate_all(&tile_cache_ctx);
+        }
+        break;
+    case READER_MENU_ACTION_SET_THEME_LIGHT:
+        if (reader_theme_get_mode() != READER_THEME_LIGHT)
+        {
+            reader_theme_toggle();
+            tile_cache_invalidate_all(&tile_cache_ctx);
+        }
+        break;
+    case READER_MENU_ACTION_SET_FONT_SMALL:
+        if (reader_font_get_profile() != READER_FONT_PROFILE_SMALL)
+        {
+            reader_font_set_profile(READER_FONT_PROFILE_SMALL);
+            needs_layout_rebuild = true;
+        }
+        break;
+    case READER_MENU_ACTION_SET_FONT_MEDIUM:
+        if (reader_font_get_profile() != READER_FONT_PROFILE_MEDIUM)
+        {
+            reader_font_set_profile(READER_FONT_PROFILE_MEDIUM);
+            needs_layout_rebuild = true;
+        }
+        break;
+    case READER_MENU_ACTION_SET_FONT_LARGE:
+        if (reader_font_get_profile() != READER_FONT_PROFILE_LARGE)
+        {
+            reader_font_set_profile(READER_FONT_PROFILE_LARGE);
+            needs_layout_rebuild = true;
+        }
+        break;
+    case READER_MENU_ACTION_NONE:
+    default:
+        break;
+    }
+
+    if (render_task_handle)
+        xTaskNotifyGive(render_task_handle);
+    printf("Menu closed: action=%d at (%u,%u)\n", (int)action, (unsigned)x, (unsigned)y);
+}
+
 static void handle_left_control_event(left_control_event_t event,
                                       uint16_t x,
                                       uint16_t y,
@@ -119,11 +191,11 @@ static void handle_left_control_event(left_control_event_t event,
     (void)user_ctx;
     switch (event)
     {
-    case LEFT_CONTROL_EVENT_TAP:
-        printf("Left control tap at (%u,%u)\n", (unsigned)x, (unsigned)y);
-        break;
     case LEFT_CONTROL_EVENT_HOLD:
-        printf("Left control hold at (%u,%u)\n", (unsigned)x, (unsigned)y);
+        menu_open = true;
+        if (render_task_handle)
+            xTaskNotifyGive(render_task_handle);
+        printf("Menu opened at (%u,%u)\n", (unsigned)x, (unsigned)y);
         break;
     default:
         break;
@@ -225,6 +297,10 @@ void app_main(void)
                                 &is_touching,
                                 &spi_bus_busy,
                                 &is_rendering_baked,
+                                &menu_open,
+                                &needs_layout_rebuild,
+                                do_layout_rebuild,
+                                NULL,
                                 &render_task_handle,
                                 &frame_count,
                                 &scratch_buffer,
@@ -247,6 +323,11 @@ void app_main(void)
     stats_ctx.count_loaded_tiles_fn = count_loaded_tiles;
 
     bake_content();
+
+    touch_runtime_set_menu(&touch_ctx,
+                           &menu_open,
+                           handle_menu_tap,
+                           NULL);
 
     if (xTaskCreatePinnedToCore(touch_poll_task, "touch", 4096, &touch_ctx, 2, NULL, 0) != pdPASS)
     {
