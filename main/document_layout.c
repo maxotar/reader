@@ -1,5 +1,7 @@
 #include "document_layout.h"
 
+#include "reader_font.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +72,7 @@ static void compute_paragraph_layout(document_layout_t *layout, const char *text
         lv_point_t paragraph_size;
         lv_txt_get_size(&paragraph_size,
                         paragraph,
-                        &lv_font_montserrat_16,
+                        reader_font_body(),
                         0,
                         BODY_LINE_SPACE,
                         CONTENT_WIDTH,
@@ -227,7 +229,7 @@ void init_document_layout(document_layout_t *layout, const char *title, const ch
     lv_point_t title_size;
     lv_txt_get_size(&title_size,
                     title,
-                    &lv_font_montserrat_18,
+                    reader_font_title(),
                     0,
                     0,
                     CONTENT_WIDTH,

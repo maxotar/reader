@@ -40,9 +40,9 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  document_layout_t *layout,
                                  tile_cache_context_t *tile_cache);
 
-IRAM_ATTR bool render_flush_ready_cb(esp_lcd_panel_io_handle_t io,
-                                     esp_lcd_panel_io_event_data_t *edata,
-                                     void *ctx);
+bool render_flush_ready_cb(esp_lcd_panel_io_handle_t io,
+                           esp_lcd_panel_io_event_data_t *edata,
+                           void *ctx);
 
 void render_task(void *arg);
 

@@ -72,7 +72,15 @@
 #include "display_hal.h"
 #include "tile_cache.h"
 #include "render_runtime.h"
+#if defined(__has_include)
+#if __has_include("content_generated.h")
+#include "content_generated.h"
+#else
 #include "content.h"
+#endif
+#else
+#include "content.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 

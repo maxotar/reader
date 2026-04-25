@@ -5,6 +5,7 @@
 
 #include "lvgl.h"
 #include "reader_config.h"
+#include "reader_font.h"
 
 void tile_cache_init_context(tile_cache_context_t *ctx,
                              document_layout_t *layout,
@@ -94,7 +95,7 @@ static bool bake_tile_bitmap(tile_cache_context_t *ctx, render_tile_t *tile)
     lv_draw_label_dsc_t title_dsc;
     lv_draw_label_dsc_init(&title_dsc);
     title_dsc.color = lv_color_hex(0xFF2200);
-    title_dsc.font = &lv_font_montserrat_18;
+    title_dsc.font = reader_font_title();
 
     int32_t title_bottom = TITLE_Y + ctx->layout->title_height;
     if (TITLE_Y < tile->end_y && title_bottom > tile->start_y)
@@ -110,7 +111,7 @@ static bool bake_tile_bitmap(tile_cache_context_t *ctx, render_tile_t *tile)
     lv_draw_label_dsc_t body_dsc;
     lv_draw_label_dsc_init(&body_dsc);
     body_dsc.color = lv_color_hex(0xCC1100);
-    body_dsc.font = &lv_font_montserrat_16;
+    body_dsc.font = reader_font_body();
     body_dsc.line_space = BODY_LINE_SPACE;
 
     for (uint32_t index = 0; index < ctx->layout->paragraph_count; index++)
