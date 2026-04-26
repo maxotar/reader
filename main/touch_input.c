@@ -1,6 +1,7 @@
 #include "touch_input.h"
 
 #include "reader_config.h"
+#include "reader_menu.h"
 #include "esp_check.h"
 #include <stdlib.h>
 
@@ -22,14 +23,16 @@ static void dispatch_left_control_event(const touch_runtime_context_t *ctx,
 
 void touch_runtime_init_context(touch_runtime_context_t *ctx,
                                 i2c_master_dev_handle_t touch_dev,
-                                volatile bool *is_touching,
-                                volatile uint16_t *touch_x,
-                                volatile uint16_t *touch_y,
+                                SemaphoreHandle_t state_mutex,
+                                bool *is_touching,
+                                uint16_t *touch_x,
+                                uint16_t *touch_y,
                                 TaskHandle_t *render_task_handle,
                                 left_control_event_cb_t left_control_cb,
                                 void *left_control_user_ctx)
 {
     ctx->touch_dev = touch_dev;
+    ctx->state_mutex = state_mutex;
     ctx->is_touching = is_touching;
     ctx->touch_x = touch_x;
     ctx->touch_y = touch_y;
@@ -41,12 +44,13 @@ void touch_runtime_init_context(touch_runtime_context_t *ctx,
     ctx->menu_tap_user_ctx = NULL;
     ctx->chapter_list_open = NULL;
     ctx->chapter_list_scroll_offset = NULL;
+    ctx->chapter_list_scroll_max = 0;
     ctx->chapter_list_tap_cb = NULL;
     ctx->chapter_list_tap_user_ctx = NULL;
 }
 
 void touch_runtime_set_menu(touch_runtime_context_t *ctx,
-                            volatile bool *menu_open,
+                            bool *menu_open,
                             menu_tap_cb_t menu_tap_cb,
                             void *menu_tap_user_ctx)
 {
@@ -56,8 +60,8 @@ void touch_runtime_set_menu(touch_runtime_context_t *ctx,
 }
 
 void touch_runtime_set_chapter_list(touch_runtime_context_t *ctx,
-                                    volatile bool *chapter_list_open,
-                                    volatile int32_t *chapter_list_scroll_offset,
+                                    bool *chapter_list_open,
+                                    int32_t *chapter_list_scroll_offset,
                                     menu_tap_cb_t chapter_list_tap_cb,
                                     void *chapter_list_tap_user_ctx)
 {
@@ -90,7 +94,7 @@ void touch_init(i2c_master_dev_handle_t *touch_dev)
 void touch_poll_task(void *arg)
 {
     touch_runtime_context_t *ctx = (touch_runtime_context_t *)arg;
-    if (!ctx || !ctx->touch_dev || !ctx->is_touching || !ctx->touch_x || !ctx->touch_y || !ctx->render_task_handle)
+    if (!ctx || !ctx->touch_dev || !ctx->is_touching || !ctx->touch_x || !ctx->touch_y || !ctx->render_task_handle || !ctx->state_mutex)
     {
         abort();
     }
@@ -112,9 +116,12 @@ void touch_poll_task(void *arg)
     bool chapter_list_dragged = false;
 
     // Chapter-list gesture zones (must match reader_menu.c layout semantics)
-    const uint16_t chapter_list_top_buttons_end_y = 66;
-    const uint16_t chapter_list_scroll_start_y = 98;
-    const uint16_t chapter_list_select_button_end_x = 64;
+    uint16_t chapter_list_top_buttons_end_y = 66;
+    uint16_t chapter_list_scroll_start_y = 98;
+    uint16_t chapter_list_select_button_end_x = 64;
+    reader_menu_chapter_list_gesture_bounds(&chapter_list_top_buttons_end_y,
+                                            &chapter_list_scroll_start_y,
+                                            &chapter_list_select_button_end_x);
 
     while (1)
     {
@@ -131,20 +138,24 @@ void touch_poll_task(void *arg)
             }
         }
 
+        xSemaphoreTake(ctx->state_mutex, portMAX_DELAY);
         *ctx->is_touching = next_touching;
         *ctx->touch_x = next_touch_x;
         *ctx->touch_y = next_touch_y;
+        bool menu_open_now = (ctx->menu_open && *ctx->menu_open);
+        bool chapter_list_open_now = (ctx->chapter_list_open && *ctx->chapter_list_open);
+        xSemaphoreGive(ctx->state_mutex);
 
         if (next_touching && !last_touching)
         {
             menu_opened_by_hold = false;
-            if (ctx->menu_open && *ctx->menu_open)
+            if (menu_open_now)
             {
                 // Menu is open: suppress hold detection, just track touch for selection.
                 left_control_tracking = false;
                 left_control_hold_fired = true;
             }
-            else if (ctx->chapter_list_open && *ctx->chapter_list_open)
+            else if (chapter_list_open_now)
             {
                 // Chapter list is open:
                 // - top strip is for Confirm/Cancel taps
@@ -174,15 +185,16 @@ void touch_poll_task(void *arg)
             int32_t delta_y = (int32_t)next_touch_y - chapter_list_last_y;
             if (delta_y != 0)
                 chapter_list_dragged = true;
+            xSemaphoreTake(ctx->state_mutex, portMAX_DELAY);
             *ctx->chapter_list_scroll_offset -= delta_y; // Invert: dragging down scrolls up
 
             // Clamp scroll offset to reasonable bounds
             if (*ctx->chapter_list_scroll_offset < 0)
                 *ctx->chapter_list_scroll_offset = 0;
-            // Max scroll would be calculated based on total chapter count * row height
-            // For now, allow reasonable scrolling - max 10000 pixels
-            if (*ctx->chapter_list_scroll_offset > 10000)
-                *ctx->chapter_list_scroll_offset = 10000;
+            if (ctx->chapter_list_scroll_max > 0 &&
+                *ctx->chapter_list_scroll_offset > ctx->chapter_list_scroll_max)
+                *ctx->chapter_list_scroll_offset = ctx->chapter_list_scroll_max;
+            xSemaphoreGive(ctx->state_mutex);
 
             chapter_list_last_y = next_touch_y;
 
@@ -223,7 +235,12 @@ void touch_poll_task(void *arg)
         if (!next_touching && last_touching)
         {
             chapter_list_scrolling = false;
-            if (ctx->chapter_list_open && *ctx->chapter_list_open)
+            xSemaphoreTake(ctx->state_mutex, portMAX_DELAY);
+            bool chapter_list_open_now = (ctx->chapter_list_open && *ctx->chapter_list_open);
+            bool menu_open_now = (ctx->menu_open && *ctx->menu_open);
+            xSemaphoreGive(ctx->state_mutex);
+
+            if (chapter_list_open_now)
             {
                 bool is_top_button_tap = (last_touch_sample < chapter_list_top_buttons_end_y);
                 bool is_select_button_tap =
@@ -236,7 +253,7 @@ void touch_poll_task(void *arg)
                     ctx->chapter_list_tap_cb(last_touch_x_sample, last_touch_sample, ctx->chapter_list_tap_user_ctx);
                 }
             }
-            else if (ctx->menu_open && *ctx->menu_open)
+            else if (menu_open_now)
             {
                 if (menu_opened_by_hold)
                 {

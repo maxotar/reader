@@ -1,5 +1,7 @@
 #include "display_hal.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_lcd_sh8601.h"
@@ -13,6 +15,23 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x29, (uint8_t[]){0x00}, 0, 10},
     {0x51, (uint8_t[]){0xFF}, 1, 0},
 };
+
+esp_err_t display_panel_sleep(esp_lcd_panel_handle_t panel)
+{
+    if (!panel)
+        return ESP_ERR_INVALID_ARG;
+
+    return esp_lcd_panel_disp_on_off(panel, false);
+}
+
+esp_err_t display_panel_wake(esp_lcd_panel_handle_t panel)
+{
+    if (!panel)
+        return ESP_ERR_INVALID_ARG;
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+    return esp_lcd_panel_disp_on_off(panel, true);
+}
 
 void display_init(esp_lcd_panel_handle_t *panel_out,
                   esp_lcd_panel_io_handle_t *io_out,
@@ -45,5 +64,5 @@ void display_init(esp_lcd_panel_handle_t *panel_out,
     ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(*io_out, &cfg, panel_out));
     esp_lcd_panel_reset(*panel_out);
     esp_lcd_panel_init(*panel_out);
-    esp_lcd_panel_disp_on_off(*panel_out, true);
+    ESP_ERROR_CHECK(display_panel_wake(*panel_out));
 }

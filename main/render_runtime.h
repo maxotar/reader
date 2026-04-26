@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -15,16 +16,17 @@
 
 typedef struct
 {
-    volatile int32_t *scroll_y;
-    volatile uint16_t *touch_x;
-    volatile uint16_t *touch_y;
-    volatile bool *is_touching;
+    SemaphoreHandle_t state_mutex;
+    int32_t *scroll_y;
+    uint16_t *touch_x;
+    uint16_t *touch_y;
+    bool *is_touching;
     volatile bool *spi_bus_busy;
-    volatile bool *is_rendering_baked;
-    volatile bool *menu_open;
-    volatile bool *chapter_list_open;
-    volatile int32_t *chapter_list_scroll_offset;
-    volatile bool *needs_layout_rebuild;
+    bool *is_rendering_baked;
+    bool *menu_open;
+    bool *chapter_list_open;
+    int32_t *chapter_list_scroll_offset;
+    bool *needs_layout_rebuild;
     void (*layout_rebuild_fn)(void *user_ctx);
     void *layout_rebuild_user_ctx;
     void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out);
@@ -38,16 +40,17 @@ typedef struct
 } render_runtime_context_t;
 
 void render_runtime_init_context(render_runtime_context_t *ctx,
-                                 volatile int32_t *scroll_y,
-                                 volatile uint16_t *touch_x,
-                                 volatile uint16_t *touch_y,
-                                 volatile bool *is_touching,
+                                 SemaphoreHandle_t state_mutex,
+                                 int32_t *scroll_y,
+                                 uint16_t *touch_x,
+                                 uint16_t *touch_y,
+                                 bool *is_touching,
                                  volatile bool *spi_bus_busy,
-                                 volatile bool *is_rendering_baked,
-                                 volatile bool *menu_open,
-                                 volatile bool *chapter_list_open,
-                                 volatile int32_t *chapter_list_scroll_offset,
-                                 volatile bool *needs_layout_rebuild,
+                                 bool *is_rendering_baked,
+                                 bool *menu_open,
+                                 bool *chapter_list_open,
+                                 int32_t *chapter_list_scroll_offset,
+                                 bool *needs_layout_rebuild,
                                  void (*layout_rebuild_fn)(void *user_ctx),
                                  void *layout_rebuild_user_ctx,
                                  void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out),

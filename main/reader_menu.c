@@ -1,10 +1,12 @@
 #include "reader_menu.h"
 
 #include "lvgl.h"
+#include "esp_log.h"
 #include "reader_config.h"
 #include "reader_font.h"
 #include "reader_theme.h"
-#include <stdio.h>
+
+static const char *TAG = "reader_menu";
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -162,7 +164,6 @@ void reader_menu_render(lv_color_t *buffer, const reader_menu_state_t *state)
 
     draw_button(canvas, CHAPTER_LIST_BTN_X, CHAPTER_LIST_BTN_Y, CHAPTER_LIST_BTN_W, CHAPTER_LIST_BTN_H,
                 false, "Browse Chapters");
-    ;
 
     // Dismiss hint
     draw_label(canvas, 0, HINT_Y, LCD_H_RES,
@@ -270,6 +271,31 @@ static int32_t chapter_list_select_btn_size_px(void)
     if (btn > 42)
         btn = 42;
     return btn;
+}
+
+int32_t reader_menu_chapter_list_max_scroll(uint16_t chapter_count)
+{
+    if (chapter_count == 0)
+        return 0;
+
+    int32_t row_pixel_height = chapter_list_row_height_px() + chapter_list_row_gap_px();
+    int32_t visible_height = CHAPTER_LIST_SCROLL_END_Y - CHAPTER_LIST_SCROLL_START_Y;
+
+    int32_t total_content = (int32_t)chapter_count * row_pixel_height;
+    int32_t max = total_content - visible_height;
+    return (max > 0) ? max : 0;
+}
+
+void reader_menu_chapter_list_gesture_bounds(uint16_t *top_buttons_end_y,
+                                             uint16_t *scroll_start_y,
+                                             uint16_t *select_button_end_x)
+{
+    if (top_buttons_end_y)
+        *top_buttons_end_y = (uint16_t)(CHAPTER_LIST_TOP_BTN_Y + CHAPTER_LIST_TOP_BTN_H);
+    if (scroll_start_y)
+        *scroll_start_y = (uint16_t)CHAPTER_LIST_SCROLL_START_Y;
+    if (select_button_end_x)
+        *select_button_end_x = (uint16_t)(8 + CHAPTER_SELECT_BTN_X + chapter_list_select_btn_size_px());
 }
 
 void reader_menu_render_chapter_list(lv_color_t *buffer, const reader_menu_state_t *state, int32_t scroll_offset)
@@ -398,14 +424,14 @@ reader_menu_action_t reader_menu_chapter_list_hit_test(const reader_menu_state_t
         // Cancel button
         if (x >= CHAPTER_LIST_CANCEL_X && x < (uint16_t)(CHAPTER_LIST_CANCEL_X + CHAPTER_LIST_CANCEL_W))
         {
-            printf("DEBUG: Button hit - CANCEL at (%u, %u)\n", (unsigned)x, (unsigned)y);
+            ESP_LOGD(TAG, "button CANCEL at (%u,%u)", (unsigned)x, (unsigned)y);
             action.type = READER_MENU_ACTION_CHAPTER_LIST_CANCEL;
             return action;
         }
         // Confirm button
         if (x >= CHAPTER_LIST_CONFIRM_X && x < (uint16_t)(CHAPTER_LIST_CONFIRM_X + CHAPTER_LIST_CONFIRM_W))
         {
-            printf("DEBUG: Button hit - CONFIRM at (%u, %u)\n", (unsigned)x, (unsigned)y);
+            ESP_LOGD(TAG, "button CONFIRM at (%u,%u)", (unsigned)x, (unsigned)y);
             action.type = READER_MENU_ACTION_CHAPTER_LIST_CONFIRM;
             return action;
         }

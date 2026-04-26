@@ -8,16 +8,17 @@
 #include "reader_menu.h"
 
 void render_runtime_init_context(render_runtime_context_t *ctx,
-                                 volatile int32_t *scroll_y,
-                                 volatile uint16_t *touch_x,
-                                 volatile uint16_t *touch_y,
-                                 volatile bool *is_touching,
+                                 SemaphoreHandle_t state_mutex,
+                                 int32_t *scroll_y,
+                                 uint16_t *touch_x,
+                                 uint16_t *touch_y,
+                                 bool *is_touching,
                                  volatile bool *spi_bus_busy,
-                                 volatile bool *is_rendering_baked,
-                                 volatile bool *menu_open,
-                                 volatile bool *chapter_list_open,
-                                 volatile int32_t *chapter_list_scroll_offset,
-                                 volatile bool *needs_layout_rebuild,
+                                 bool *is_rendering_baked,
+                                 bool *menu_open,
+                                 bool *chapter_list_open,
+                                 int32_t *chapter_list_scroll_offset,
+                                 bool *needs_layout_rebuild,
                                  void (*layout_rebuild_fn)(void *user_ctx),
                                  void *layout_rebuild_user_ctx,
                                  void (*menu_state_fn)(void *user_ctx, reader_menu_state_t *state_out),
@@ -29,6 +30,7 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
                                  document_layout_t *layout,
                                  tile_cache_context_t *tile_cache)
 {
+    ctx->state_mutex = state_mutex;
     ctx->scroll_y = scroll_y;
     ctx->touch_x = touch_x;
     ctx->touch_y = touch_y;
@@ -49,6 +51,18 @@ void render_runtime_init_context(render_runtime_context_t *ctx,
     ctx->panel = panel;
     ctx->layout = layout;
     ctx->tile_cache = tile_cache;
+}
+
+static inline void state_lock(SemaphoreHandle_t mutex)
+{
+    if (mutex)
+        xSemaphoreTake(mutex, portMAX_DELAY);
+}
+
+static inline void state_unlock(SemaphoreHandle_t mutex)
+{
+    if (mutex)
+        xSemaphoreGive(mutex);
 }
 
 IRAM_ATTR bool render_flush_ready_cb(esp_lcd_panel_io_handle_t io,
@@ -89,9 +103,6 @@ static float touch_position_scroll_velocity(uint16_t touch_y)
     // Quadratic ramp: very fine low-end control, then faster acceleration near bottom.
     float curved = normalized * normalized;
     float max_speed = (float)TOUCH_SCROLL_FORWARD_MAX_PX_PER_FRAME;
-    if (max_speed < 1.0f)
-        max_speed = 1.0f;
-
     return curved * max_speed;
 }
 
@@ -99,7 +110,7 @@ void render_task(void *arg)
 {
     render_runtime_context_t *ctx = (render_runtime_context_t *)arg;
     if (!ctx || !ctx->scroll_y || !ctx->touch_x || !ctx->touch_y || !ctx->is_touching || !ctx->spi_bus_busy ||
-        !ctx->is_rendering_baked || !ctx->render_task_handle || !ctx->frame_count ||
+        !ctx->is_rendering_baked || !ctx->render_task_handle || !ctx->frame_count || !ctx->state_mutex ||
         !ctx->scratch_buffer || !ctx->layout || !ctx->tile_cache)
     {
         abort();
@@ -112,32 +123,65 @@ void render_task(void *arg)
 
     while (1)
     {
+        int32_t local_scroll_y = 0;
+        uint16_t local_touch_x = 0;
+        uint16_t local_touch_y = 0;
+        bool local_is_touching = false;
+        bool local_menu_open = false;
+        bool local_chapter_list_open = false;
+        int32_t local_chapter_list_scroll_offset = 0;
+        bool local_is_rendering_baked = false;
+        bool do_layout_rebuild = false;
+
+        state_lock(ctx->state_mutex);
+        local_scroll_y = *ctx->scroll_y;
+        local_touch_x = *ctx->touch_x;
+        local_touch_y = *ctx->touch_y;
+        local_is_touching = *ctx->is_touching;
+        local_menu_open = (ctx->menu_open && *ctx->menu_open);
+        local_chapter_list_open = (ctx->chapter_list_open && *ctx->chapter_list_open);
+        local_chapter_list_scroll_offset = (ctx->chapter_list_scroll_offset) ? *ctx->chapter_list_scroll_offset : 0;
+        local_is_rendering_baked = *ctx->is_rendering_baked;
+        if (ctx->needs_layout_rebuild && *ctx->needs_layout_rebuild)
+        {
+            *ctx->needs_layout_rebuild = false;
+            do_layout_rebuild = true;
+        }
+        state_unlock(ctx->state_mutex);
+
         int32_t max_scroll_y = ctx->layout->total_height - LCD_V_RES;
         if (max_scroll_y < 0)
             max_scroll_y = 0;
 
-        bool scroll_touch_active = *ctx->is_touching && (*ctx->touch_x >= (LCD_H_RES / 2));
+        bool fast_loop_needed = false;
+
+        bool scroll_touch_active = local_is_touching && (local_touch_x >= (LCD_H_RES / 2));
 
         if (scroll_touch_active)
         {
-            float velocity = touch_position_scroll_velocity(*ctx->touch_y);
+            float velocity = touch_position_scroll_velocity(local_touch_y);
+            if (velocity != 0.0f)
+                fast_loop_needed = true;
             scroll_accumulator += velocity;
 
             int32_t position_step = (int32_t)scroll_accumulator;
             if (position_step != 0)
             {
                 scroll_accumulator -= (float)position_step;
-                *ctx->scroll_y += position_step;
-                if (*ctx->scroll_y < 0)
+                local_scroll_y += position_step;
+                if (local_scroll_y < 0)
                 {
-                    *ctx->scroll_y = 0;
+                    local_scroll_y = 0;
                     scroll_accumulator = 0.0f;
                 }
-                if (*ctx->scroll_y > max_scroll_y)
+                if (local_scroll_y > max_scroll_y)
                 {
-                    *ctx->scroll_y = max_scroll_y;
+                    local_scroll_y = max_scroll_y;
                     scroll_accumulator = 0.0f;
                 }
+                state_lock(ctx->state_mutex);
+                *ctx->scroll_y = local_scroll_y;
+                state_unlock(ctx->state_mutex);
             }
         }
         else
@@ -146,18 +190,26 @@ void render_task(void *arg)
         }
 
         // --- Layout rebuild (triggered by font size change; runs in render task for safe access) ---
-        if (ctx->needs_layout_rebuild && *ctx->needs_layout_rebuild)
+        if (do_layout_rebuild)
         {
-            *ctx->needs_layout_rebuild = false;
             if (ctx->layout_rebuild_fn)
                 ctx->layout_rebuild_fn(ctx->layout_rebuild_user_ctx);
             last_blit_scroll_y = -1;
+            state_lock(ctx->state_mutex);
+            local_scroll_y = *ctx->scroll_y;
+            local_menu_open = (ctx->menu_open && *ctx->menu_open);
+            local_chapter_list_open = (ctx->chapter_list_open && *ctx->chapter_list_open);
+            local_chapter_list_scroll_offset = (ctx->chapter_list_scroll_offset) ? *ctx->chapter_list_scroll_offset : 0;
+            local_is_rendering_baked = *ctx->is_rendering_baked;
+            state_unlock(ctx->state_mutex);
         }
 
         // --- Menu overlay: render once per open; skip normal tile path while open ---
-        bool menu_currently_open = (ctx->menu_open && *ctx->menu_open);
+        bool menu_currently_open = local_menu_open;
         if (menu_currently_open)
         {
+            if (local_is_touching)
+                fast_loop_needed = true;
             if (!menu_rendered && *ctx->scratch_buffer && !*ctx->spi_bus_busy)
             {
                 reader_menu_state_t menu_state = {0};
@@ -175,13 +227,15 @@ void render_task(void *arg)
         menu_rendered = false; // reset so menu re-renders next time it opens
 
         // --- Chapter list overlay: redraw when list state changes; skip normal tile path while open ---
-        bool chapter_list_currently_open = (ctx->chapter_list_open && *ctx->chapter_list_open);
+        bool chapter_list_currently_open = local_chapter_list_open;
         static bool chapter_list_rendered = false;
         static int32_t chapter_list_last_scroll_offset = -1;
         static uint16_t chapter_list_last_selected = UINT16_MAX;
         if (chapter_list_currently_open)
         {
-            int32_t scroll_offset = (ctx->chapter_list_scroll_offset) ? *ctx->chapter_list_scroll_offset : 0;
+            if (local_is_touching)
+                fast_loop_needed = true;
+            int32_t scroll_offset = local_chapter_list_scroll_offset;
             reader_menu_state_t menu_state = {0};
             if (ctx->menu_state_fn)
                 ctx->menu_state_fn(ctx->menu_state_user_ctx, &menu_state);
@@ -207,24 +261,24 @@ void render_task(void *arg)
         chapter_list_last_scroll_offset = -1;
         chapter_list_last_selected = UINT16_MAX;
 
-        int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (*ctx->scroll_y - last_blit_scroll_y);
+        int32_t scroll_step = (last_blit_scroll_y < 0) ? 0 : (local_scroll_y - last_blit_scroll_y);
         int32_t delta_scroll = scroll_step;
         if (delta_scroll < 0)
             delta_scroll = -delta_scroll;
 
         bool should_redraw = (last_blit_scroll_y < 0) || (delta_scroll >= SCROLL_REDRAW_THRESHOLD_PX);
-        if (*ctx->is_rendering_baked && *ctx->scratch_buffer && !*ctx->spi_bus_busy && should_redraw)
+        if (local_is_rendering_baked && *ctx->scratch_buffer && !*ctx->spi_bus_busy && should_redraw)
         {
-            int32_t tile_idx = find_tile_for_y(ctx->layout, *ctx->scroll_y);
+            int32_t tile_idx = find_tile_for_y(ctx->layout, local_scroll_y);
             if (tile_idx >= 0 && tile_cache_ensure_resident(ctx->tile_cache, tile_idx))
             {
                 *ctx->spi_bus_busy = true;
                 render_tile_t *tile = &ctx->layout->tiles[tile_idx];
-                int32_t viewport_end_y = *ctx->scroll_y + LCD_V_RES;
+                int32_t viewport_end_y = local_scroll_y + LCD_V_RES;
 
                 if (viewport_end_y <= tile->end_y)
                 {
-                    lv_color_t *ptr = &tile->buffer[(*ctx->scroll_y - tile->start_y) * LCD_H_RES];
+                    lv_color_t *ptr = &tile->buffer[(local_scroll_y - tile->start_y) * LCD_H_RES];
                     esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, ptr);
                 }
                 else
@@ -236,9 +290,9 @@ void render_task(void *arg)
                         goto render_wait;
                     }
 
-                    int32_t rows_from_current = tile->end_y - *ctx->scroll_y;
+                    int32_t rows_from_current = tile->end_y - local_scroll_y;
                     memcpy(*ctx->scratch_buffer,
-                           &tile->buffer[(*ctx->scroll_y - tile->start_y) * LCD_H_RES],
+                           &tile->buffer[(local_scroll_y - tile->start_y) * LCD_H_RES],
                            (size_t)rows_from_current * LCD_H_RES * sizeof(lv_color_t));
 
                     int32_t rows_from_next = LCD_V_RES - rows_from_current;
@@ -255,15 +309,17 @@ void render_task(void *arg)
                     }
                     esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, LCD_H_RES, LCD_V_RES, *ctx->scratch_buffer);
                 }
-                last_blit_scroll_y = *ctx->scroll_y;
+                last_blit_scroll_y = local_scroll_y;
+                state_lock(ctx->state_mutex);
                 (*ctx->frame_count)++;
+                state_unlock(ctx->state_mutex);
 
                 tile_cache_prefetch_neighbors(ctx->tile_cache, tile_idx, (scroll_step < 0) ? -1 : 1);
             }
         }
 
     render_wait:
-        uint32_t wait_ms = *ctx->is_touching ? SCROLL_ACTIVE_FRAME_MS : SCROLL_IDLE_SLEEP_MS;
+        uint32_t wait_ms = fast_loop_needed ? SCROLL_ACTIVE_FRAME_MS : SCROLL_IDLE_SLEEP_MS;
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
 }

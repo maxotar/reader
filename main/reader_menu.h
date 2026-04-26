@@ -10,7 +10,6 @@ typedef struct
 {
     uint16_t chapter_count;
     uint16_t current_chapter;
-    uint16_t chapter_page_start;
     const char *const *chapter_titles;
 } reader_menu_state_t;
 
@@ -22,8 +21,6 @@ typedef enum
     READER_MENU_ACTION_SET_FONT_SMALL,
     READER_MENU_ACTION_SET_FONT_MEDIUM,
     READER_MENU_ACTION_SET_FONT_LARGE,
-    READER_MENU_ACTION_CHAPTER_PAGE_PREV,
-    READER_MENU_ACTION_CHAPTER_PAGE_NEXT,
     READER_MENU_ACTION_CHAPTER_OPEN,
     READER_MENU_ACTION_OPEN_CHAPTER_LIST,
     READER_MENU_ACTION_CHAPTER_LIST_SELECT,
@@ -49,5 +46,13 @@ reader_menu_action_t reader_menu_hit_test(const reader_menu_state_t *state, uint
 
 // Hit-test for scrollable chapter list view
 reader_menu_action_t reader_menu_chapter_list_hit_test(const reader_menu_state_t *state, int32_t scroll_offset, uint16_t x, uint16_t y);
+
+// Returns the maximum valid scroll offset for a chapter list with the given chapter count.
+int32_t reader_menu_chapter_list_max_scroll(uint16_t chapter_count);
+
+// Returns gesture/layout bounds used by touch handling for the chapter list screen.
+void reader_menu_chapter_list_gesture_bounds(uint16_t *top_buttons_end_y,
+                                             uint16_t *scroll_start_y,
+                                             uint16_t *select_button_end_x);
 
 #endif
